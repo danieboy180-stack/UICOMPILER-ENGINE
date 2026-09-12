@@ -65,16 +65,27 @@ def run_spam():
     def process_bundle(idx, b_name, b_bytes):
         target = inbox / "layer12_bundle.json"
         
-        # Write to inbox exclusively
+        # Write to inbox exclusively — wait if another thread hasn't cleared it yet
         while target.exists():
             time.sleep(0.01)
         target.write_bytes(b_bytes)
+        # O15 Fix (WinError 32): yield the OS file handle before ingest opens the file.
+        # On Windows, write_bytes holds a kernel handle briefly after close(); a tiny sleep
+        # lets it drain so shutil.move() inside ingest doesn't race with our own open handle.
+        time.sleep(0.05)
         
         res = run_single_bundle(manifest_path, idx)
         
-        # If it wasn't picked up (pipeline empty run), clean it up so next can proceed
+        # O15 Fix (WinError 32): cleanup unlink uses retry-with-backoff instead of bare
+        # unlink, because ingest's shutil.move() may still hold a transient lock on the file
+        # for a few ms after our pipeline call returns.
         if target.exists():
-            target.unlink(missing_ok=True)
+            for _attempt in range(10):
+                try:
+                    target.unlink(missing_ok=True)
+                    break
+                except PermissionError:
+                    time.sleep(0.05)
             
         if res is not None:
             res['original_name'] = b_name
