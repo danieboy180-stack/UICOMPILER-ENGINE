@@ -1,0 +1,10 @@
+Archives/
+Artifacts/
+Checkpoints/
+Logs/
+Manifest/
+Python_Inbox/
+Python_Output/
+Reports/
+__pycache__/
+*.pyc
