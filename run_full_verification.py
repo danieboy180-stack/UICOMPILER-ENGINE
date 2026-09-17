@@ -24,6 +24,8 @@ import json
 import time
 import datetime
 import subprocess
+import os
+import uuid
 from pathlib import Path
 
 # Force UTF-8 output on Windows terminals that default to cp1252
@@ -33,15 +35,18 @@ if hasattr(sys.stdout, 'reconfigure'):
 ROOT = Path(__file__).parent.resolve()
 
 
-def run_tests() -> bool:
+def run_tests(session_id: str) -> bool:
     """Run the full O14 spam suite. Returns True if the subprocess exited 0."""
     print("=" * 70)
     print("STEP 1: Running spam test suite (O14)...")
     print("=" * 70)
     spam_script = ROOT / "tests" / "spam" / "run_spam_test.py"
+    environment = os.environ.copy()
+    environment["VERIFICATION_SESSION_ID"] = session_id
     result = subprocess.run(
         [sys.executable, str(spam_script)],
         cwd=str(ROOT),
+        env=environment,
         capture_output=False,   # Let output stream live to terminal
     )
     print()
@@ -55,9 +60,10 @@ def read_ledger() -> list:
         print(f"ERROR: Ledger not found at {ledger_path}")
         sys.exit(1)
 
+    from orchestrator.lock import locked_read
     entries = []
-    with open(ledger_path, "r", encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
+    with locked_read(ledger_path, default="", parse_json=False) as content:
+        for lineno, line in enumerate(content.splitlines(), 1):
             line = line.strip()
             if not line:
                 continue
@@ -68,12 +74,15 @@ def read_ledger() -> list:
     return entries
 
 
-def build_report(entries: list) -> str:
+def build_report(entries: list, session_id: str) -> str:
     """
     Derive a plain-language report ENTIRELY from ledger entries.
     No hardcoded pass counts. No cached results. Every number comes from the ledger.
     """
     now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    session_entries = [e for e in entries if e.get("verification_session_id") == session_id]
+    session_o14_entries = [e for e in session_entries if e.get("stage_id", "").startswith("O14")]
 
     # Split by stage
     o14_entries = [e for e in entries if e.get("stage_id", "").startswith("O14")]
@@ -84,7 +93,7 @@ def build_report(entries: list) -> str:
     failed = sum(1 for e in entries if not e.get("passed"))
 
     # Critical findings: crashes, hangs, silent drops — detected from raw_output_excerpt
-    critical = []
+    all_time_critical = []
     for e in o14_entries:
         excerpt = e.get("raw_output_excerpt", "")
         claim = e.get("claim", "")
@@ -92,7 +101,7 @@ def build_report(entries: list) -> str:
             "TypeError", "NoneType", "WinError 32", "PermissionError",
             "HANG", "Traceback", "CRASH", "SILENT_DROP"
         ]):
-            critical.append({
+            all_time_critical.append({
                 "claim": claim,
                 "stage": e.get("stage_id"),
                 "excerpt": excerpt[:400],
@@ -101,13 +110,25 @@ def build_report(entries: list) -> str:
             })
 
     # 5-Dimension scoring derived from ledger evidence
-    crash_entries = [e for e in o14_entries if "TypeError" in e.get("raw_output_excerpt", "") or
+    critical = []
+    for e in session_o14_entries:
+        excerpt = e.get("raw_output_excerpt", "")
+        if any(kw in excerpt for kw in ["TypeError", "NoneType", "WinError 32", "PermissionError", "HANG", "Traceback", "CRASH", "SILENT_DROP"]):
+            critical.append({
+                "claim": e.get("claim", ""),
+                "stage": e.get("stage_id"),
+                "excerpt": excerpt[:400],
+                "passed": e.get("passed"),
+                "ts": e.get("timestamp", 0),
+            })
+
+    crash_entries = [e for e in session_o14_entries if "TypeError" in e.get("raw_output_excerpt", "") or
                      "NoneType" in e.get("raw_output_excerpt", "") or
                      "Traceback" in e.get("raw_output_excerpt", "")]
-    hang_entries = [e for e in o14_entries if "HANG" in e.get("raw_output_excerpt", "")]
-    silent_drop_entries = [e for e in o14_entries if "SILENT_DROP" in e.get("raw_output_excerpt", "") or
+    hang_entries = [e for e in session_o14_entries if "HANG" in e.get("raw_output_excerpt", "")]
+    silent_drop_entries = [e for e in session_o14_entries if "SILENT_DROP" in e.get("raw_output_excerpt", "") or
                            "No output produced" in e.get("raw_output_excerpt", "")]
-    winerr_entries = [e for e in o14_entries if "WinError 32" in e.get("raw_output_excerpt", "") or
+    winerr_entries = [e for e in session_o14_entries if "WinError 32" in e.get("raw_output_excerpt", "") or
                       "PermissionError" in e.get("raw_output_excerpt", "")]
 
     crash_count = len(crash_entries)
@@ -126,6 +147,7 @@ def build_report(entries: list) -> str:
     lines.append(f"# VERIFICATION REPORT")
     lines.append(f"")
     lines.append(f"Generated: {now_ts}")
+    lines.append(f"Verification session: `{session_id}`")
     lines.append(f"Source: `Logs/Verification_Ledger.json` (read live — {total} total entries)")
     lines.append(f"")
     lines.append(f"---")
@@ -139,11 +161,12 @@ def build_report(entries: list) -> str:
     lines.append(f"| Other stage entries | {len(other_entries)} |")
     lines.append(f"| Passed | {passed} |")
     lines.append(f"| Failed | {failed} |")
-    lines.append(f"| **Critical findings** | **{len(critical)}** |")
+    lines.append(f"| **Critical findings THIS SESSION** | **{len(critical)}** |")
+    lines.append(f"| Critical findings ALL TIME | {len(all_time_critical)} |")
     lines.append(f"")
     lines.append(f"---")
     lines.append(f"")
-    lines.append(f"## Critical Findings ({len(critical)})")
+    lines.append(f"## Critical Findings THIS SESSION ({len(critical)})")
     lines.append(f"")
 
     if not critical:
@@ -199,13 +222,13 @@ def main():
     print("=" * 70)
     print()
 
-    # Step 1: Run the tests
-    suite_ok = run_tests()
+    session_id = uuid.uuid4().hex
+    print(f"Verification session: {session_id}")
+    suite_ok = run_tests(session_id)
     if not suite_ok:
-        print("WARNING: Test suite exited non-zero. Report will still be generated from ledger.")
+        print("WARNING: Test suite exited non-zero. Report will still be generated from this session ledger.")
         print()
 
-    # Step 2: Read the ledger (fresh — never cached)
     print("=" * 70)
     print("STEP 2: Reading Logs/Verification_Ledger.json (live, not cached)...")
     print("=" * 70)
@@ -213,15 +236,17 @@ def main():
     print(f"  -> Loaded {len(entries)} ledger entries.")
     print()
 
-    # Step 3: Build report
-    report_text = build_report(entries)
+    # The report's primary signal is limited to receipts tagged by this invocation.
+    report_text = build_report(entries, session_id)
 
     # Step 4: Write to file
     ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     report_dir = ROOT / "Reports"
     report_dir.mkdir(exist_ok=True)
     report_path = report_dir / f"VERIFICATION_REPORT_{ts}.md"
-    report_path.write_text(report_text, encoding="utf-8")
+    from orchestrator.lock import locked_write
+    with locked_write(report_path, report_text):
+        pass
 
     # Step 5: Print to terminal
     print("=" * 70)

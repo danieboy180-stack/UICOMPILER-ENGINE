@@ -1,0 +1,21 @@
+{
+  "schema_version": "2.1",
+  "project_id": "golden_test",
+  "semantics": [
+    {
+      "id": "btn-001",
+      "semantic_role": "button",
+      "semantic_variant": "primary"
+    },
+    {
+      "id": "inp-002",
+      "semantic_role": "input",
+      "semantic_variant": "text"
+    },
+    {
+      "id": "lbl-003",
+      "semantic_role": "text",
+      "semantic_variant": "caption"
+    }
+  ]
+}

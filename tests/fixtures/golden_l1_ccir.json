@@ -1,0 +1,26 @@
+{
+  "schema_version": "2.1",
+  "project_id": "golden_test",
+  "pipeline_id": "golden_pipeline_001",
+  "image_hash": "abc123golden",
+  "candidates": [
+    {
+      "id": "btn-001",
+      "bbox": { "x": 10, "y": 20, "w": 100, "h": 40 },
+      "confidence": 0.97,
+      "ocr_text": null
+    },
+    {
+      "id": "inp-002",
+      "bbox": { "x": 10, "y": 80, "w": 200, "h": 36 },
+      "confidence": 0.95,
+      "ocr_text": null
+    },
+    {
+      "id": "lbl-003",
+      "bbox": { "x": 10, "y": 5, "w": 150, "h": 18 },
+      "confidence": 0.92,
+      "ocr_text": "Email"
+    }
+  ]
+}

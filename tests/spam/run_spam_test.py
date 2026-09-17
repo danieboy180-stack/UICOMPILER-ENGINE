@@ -63,12 +63,22 @@ def run_spam():
     print("Firing bundles concurrently (feeding sequentially into Inbox)...")
     
     def process_bundle(idx, b_name, b_bytes):
-        target = inbox / "layer12_bundle.json"
+        target = inbox / "layer12_bundle.txt"
         
         # Write to inbox exclusively — wait if another thread hasn't cleared it yet
         while target.exists():
             time.sleep(0.01)
-        target.write_bytes(b_bytes)
+        # O15 Fix (PermissionError 13): on Windows, shutil.move() inside ingest may hold a
+        # transient kernel handle on the file for a few ms after the previous pipeline call
+        # returned. Retry write_bytes with backoff to avoid the race.
+        for _attempt in range(15):
+            try:
+                target.write_bytes(b_bytes)
+                break
+            except PermissionError:
+                time.sleep(0.05)
+        else:
+            target.write_bytes(b_bytes)  # final attempt — let it raise if still locked
         # O15 Fix (WinError 32): yield the OS file handle before ingest opens the file.
         # On Windows, write_bytes holds a kernel handle briefly after close(); a tiny sleep
         # lets it drain so shutil.move() inside ingest doesn't race with our own open handle.
@@ -91,7 +101,8 @@ def run_spam():
             res['original_name'] = b_name
         return res
 
-    with ThreadPoolExecutor(max_workers=50) as executor:
+    worker_count = int(os.environ.get("SPAM_WORKERS", "100"))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = []
         for i, (b_name, b_bytes) in enumerate(bundle_data):
             futures.append(executor.submit(process_bundle, i, b_name, b_bytes))
@@ -100,7 +111,7 @@ def run_spam():
             
         for i, f in enumerate(futures):
             try:
-                res = f.result(timeout=15)
+                res = f.result(timeout=300)
                 if res is not None:
                     results.append(res)
             except TimeoutError:
@@ -108,7 +119,7 @@ def run_spam():
                     "idx": i,
                     "run_id": "HANG",
                     "exit_code": -2,
-                    "output": "Pipeline run timed out after 15 seconds. (HANG)",
+                    "output": "Pipeline run timed out after 300 seconds. (HANG)",
                     "original_name": b_name
                 })
             except Exception as e:

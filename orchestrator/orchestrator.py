@@ -57,8 +57,12 @@ class RunLogger:
             "status": status,
             "message": mask_secrets(message)
         }
-        with open(self.log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(log_entry) + "\n")
+        from .lock import locked_append
+        try:
+            locked_append(self.log_path, json.dumps(log_entry) + "\n")
+        except (TimeoutError, OSError):
+            # Logging contention must not turn the pipeline's original result into a crash.
+            return
 
 class Stage:
     name: str = "Stage"
@@ -95,12 +99,14 @@ class IngestStage(Stage):
                 fresh.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                 for mf in fresh:
                     try:
-                        with open(mf, 'r', encoding='utf-8') as f:
-                            manifest = json.load(f)
-                        run_id = manifest.get("artifacts", {}).get("layer12_bundle", {}).get("run_id")
+                        from .lock import locked_read
+                        with locked_read(mf) as manifest:
+                            pass
+                        run_id = manifest.get("run_id")
                         if run_id and mf.name == f"manifest_{run_id}.json":
                             ctx.run_id = run_id
                             ctx.manifest_path = mf
+                            ctx.logger = RunLogger(root, run_id)
                             break
                     except (OSError, json.JSONDecodeError):
                         pass
@@ -119,17 +125,242 @@ class IngestStage(Stage):
             ctx.logger.log(self.name, "ERROR", f"ingest.ingest returned {res}")
             return False
 
+class FreezeBoundaryStage(Stage):
+    name = "FreezeBoundary"
+    
+    def _extract_ids(self, data: Any, result: set = None) -> set:
+        if result is None: result = set()
+        if isinstance(data, dict):
+            obj_id = data.get("id")
+            if obj_id is not None and isinstance(obj_id, str):
+                result.add(obj_id)
+            for v in data.values():
+                self._extract_ids(v, result)
+        elif isinstance(data, list):
+            for item in data:
+                self._extract_ids(item, result)
+        return result
+
+    def run(self, ctx: PipelineContext) -> bool:
+        root = ctx.manifest_path.parent.parent
+        l1_path = root / "Artifacts" / "layer1_ccir.json"
+        l2_path = root / "Artifacts" / "layer2_csir.json"
+        
+        if not l1_path.exists() or not l2_path.exists():
+            return True
+            
+        from .lock import locked_read
+        with locked_read(l1_path, default={}) as l1_data:
+            ctx.storage["l1_data"] = l1_data
+            
+        with locked_read(l2_path, default={}) as l2_data:
+            ctx.storage["l2_data"] = l2_data
+            
+        l1_ids = self._extract_ids(ctx.storage["l1_data"])
+        l2_ids = self._extract_ids(ctx.storage["l2_data"])
+            
+        diff = l2_ids - l1_ids
+        if diff:
+            ctx.logger.log(self.name, "ERROR", f"FREEZE_VIOLATION: L2 invented IDs {diff}")
+            ctx.storage["pipeline_status"] = "FREEZE_VIOLATION"
+            return False
+            
+        return True
+        
+    def failure_code(self, ctx: PipelineContext) -> int:
+        return 10  # EXIT_10
+
 class ValidateL1Stage(Stage):
     name = "ValidateL1"
+    
+    FORBIDDEN_L1_FIELDS = {"component", "template", "navigation_graph", "layout_engine", "region_type", "interaction_graph"}
+    
+    def _walk_l1(self, data: Any, path: str = "") -> str:
+        if isinstance(data, dict):
+            for k, v in data.items():
+                current_path = f"{path}.{k}" if path else k
+                if k in self.FORBIDDEN_L1_FIELDS:
+                    return current_path
+                res = self._walk_l1(v, current_path)
+                if res: return res
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                current_path = f"{path}[{i}]"
+                res = self._walk_l1(item, current_path)
+                if res: return res
+        return None
+
+    def run(self, ctx: PipelineContext) -> bool:
+        data = ctx.storage.get("l1_data")
+        if data is None:
+            return True
+            
+        from .bridge import bridge_l1_to_l2, SchemaBridgeError
+        try:
+            bridge_l1_to_l2(data)
+        except SchemaBridgeError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+            
+        violating_path = self._walk_l1(data)
+        if violating_path:
+            ctx.logger.log(self.name, "ERROR", f"Forbidden field found at {violating_path}")
+            return False
+        return True
 
 class ValidateL2Stage(Stage):
     name = "ValidateL2"
+    
+    def _extract_objects(self, data: Any, result: dict = None) -> dict:
+        if result is None: result = {}
+        if isinstance(data, dict):
+            obj_id = data.get("id")
+            if obj_id is not None and isinstance(obj_id, str):
+                result[obj_id] = data
+            for v in data.values():
+                self._extract_objects(v, result)
+        elif isinstance(data, list):
+            for item in data:
+                self._extract_objects(item, result)
+        return result
+
+    def _validate_l2(self, l2_data: Any, l1_map: dict, path: str = "") -> str:
+        if isinstance(l2_data, dict):
+            obj_id = l2_data.get("id")
+            if obj_id is not None and isinstance(obj_id, str):
+                l1_obj = l1_map.get(obj_id)
+                if not l1_obj:
+                    return f"{path} (id: {obj_id} not in Layer1)"
+                
+                for k, v in l2_data.items():
+                    if k in ("text", "color", "position"):
+                        if l1_obj.get(k) is None:
+                            return f"{path}.{k}"
+            
+            for k, v in l2_data.items():
+                current_path = f"{path}.{k}" if path else k
+                res = self._validate_l2(v, l1_map, current_path)
+                if res: return res
+        elif isinstance(l2_data, list):
+            for i, item in enumerate(l2_data):
+                current_path = f"{path}[{i}]"
+                res = self._validate_l2(item, l1_map, current_path)
+                if res: return res
+        return None
+
+    def run(self, ctx: PipelineContext) -> bool:
+        l1_data = ctx.storage.get("l1_data")
+        l2_data = ctx.storage.get("l2_data")
+        
+        if l1_data is None or l2_data is None:
+            return True
+            
+        from .bridge import bridge_l2_to_l3, SchemaBridgeError
+        try:
+            bridge_l2_to_l3(l2_data)
+        except SchemaBridgeError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+            
+        l1_map = self._extract_objects(l1_data)
+        violating_path = self._validate_l2(l2_data, l1_map)
+        
+        if violating_path:
+            ctx.logger.log(self.name, "ERROR", f"L2 field not traceable to L1 found at {violating_path}")
+            return False
+        return True
+
+class ConfidencePropagationStage(Stage):
+    name = "ConfidencePropagation"
+    
+    CONFIDENCE_THRESHOLD = 0.8
+    
+    def _extract_objects(self, data: Any, result: dict = None) -> dict:
+        if result is None: result = {}
+        if isinstance(data, dict):
+            obj_id = data.get("id")
+            if obj_id is not None and isinstance(obj_id, str):
+                result[obj_id] = data
+            for v in data.values():
+                self._extract_objects(v, result)
+        elif isinstance(data, list):
+            for item in data:
+                self._extract_objects(item, result)
+        return result
+        
+    def _propagate(self, l2_data: Any, l1_map: dict):
+        if isinstance(l2_data, dict):
+            obj_id = l2_data.get("id")
+            if obj_id is not None and isinstance(obj_id, str):
+                l1_obj = l1_map.get(obj_id)
+                if l1_obj is not None:
+                    conf = l1_obj.get("confidence")
+                    if conf is not None and conf < self.CONFIDENCE_THRESHOLD:
+                        l2_data["weak_child"] = True
+            for v in l2_data.values():
+                self._propagate(v, l1_map)
+        elif isinstance(l2_data, list):
+            for item in l2_data:
+                self._propagate(item, l1_map)
+
+    def run(self, ctx: PipelineContext) -> bool:
+        l1_data = ctx.storage.get("l1_data")
+        l2_data = ctx.storage.get("l2_data")
+        
+        if l1_data is None or l2_data is None:
+            return True
+            
+        l1_map = self._extract_objects(l1_data)
+        
+        import copy
+        l2_updated = copy.deepcopy(l2_data)
+        self._propagate(l2_updated, l1_map)
+        
+        ctx.storage["l2_data"] = l2_updated
+        
+        root = ctx.manifest_path.parent.parent
+        l2_path = root / "Artifacts" / "layer2_csir.json"
+        
+        # Overwrite the artifact on disk so tests and future stages can see it
+        from .lock import locked_write
+        with locked_write(l2_path, l2_updated):
+            pass
+            
+        return True
 
 class ValidateL3Stage(Stage):
     name = "ValidateL3"
+    
+    def run(self, ctx: PipelineContext) -> bool:
+        l3_data = ctx.storage.get("l3_data")
+        if l3_data is None:
+            return True
+            
+        from .bridge import bridge_l3_to_l4_1, SchemaBridgeError
+        try:
+            bridge_l3_to_l4_1(l3_data)
+        except SchemaBridgeError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+            
+        return True
 
 class ValidateL4_1Stage(Stage):
     name = "ValidateL4.1"
+    
+    def run(self, ctx: PipelineContext) -> bool:
+        l4_1_data = ctx.storage.get("l4_1_data")
+        if l4_1_data is None:
+            return True
+            
+        from .bridge import bridge_l4_1_to_l4_2, SchemaBridgeError
+        try:
+            bridge_l4_1_to_l4_2(l4_1_data)
+        except SchemaBridgeError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+            
+        return True
 
 class ValidateL4_2Stage(Stage):
     name = "ValidateL4.2"
@@ -151,13 +382,18 @@ class Layer4_3Stage(Stage):
         
         parent_hash = None
         if ctx.manifest_path.exists():
-            with open(ctx.manifest_path, 'r', encoding='utf-8') as f:
-                manifest = json.load(f)
-                parent_hash = manifest.get("artifacts", {}).get("layer12_bundle", {}).get("hash")
-                
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path) as manifest:
+                pass
+                parent_hash = manifest.get("layer2_hash")
+
         payload = {"layer": "4.3", "payload": "completed"}
-        write_atomic_artifact(root, "layer4_3", ctx.run_id, payload, parent_hash)
-        return True
+        try:
+            write_atomic_artifact(root, "layer4_3", ctx.run_id, payload, parent_hash)
+            return True
+        except ValueError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
 
 class Layer5Stage(Stage):
     name = "Layer5"
@@ -206,8 +442,9 @@ class Layer5Stage(Stage):
         # Determine parent hash from manifest if possible
         parent_hash = None
         if ctx.manifest_path.exists():
-            with open(ctx.manifest_path, 'r', encoding='utf-8') as f:
-                manifest = json.load(f)
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path) as manifest:
+                pass
                 parent_hash = manifest.get("artifacts", {}).get("layer4_3", {}).get("hash")
         
         # Test 1: simulate failed gate
@@ -220,14 +457,19 @@ class Layer5Stage(Stage):
             # Write partial output to test Rollback
             output_file = root / "Artifacts" / "layer5.json"
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_file, "w", encoding="utf-8") as f:
-                f.write('{"partial": "data"') 
+            from .lock import locked_write
+            with locked_write(output_file, '{"partial": "data"'):
+                pass
             return False
             
         # Normal write (Substage F)
         payload = {"layer": 5, "payload": "completed"}
-        write_atomic_artifact(root, "layer5", ctx.run_id, payload, parent_hash)
-        return True
+        try:
+            write_atomic_artifact(root, "layer5", ctx.run_id, payload, parent_hash)
+            return True
+        except ValueError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
         
     def failure_code(self, ctx: PipelineContext) -> int:
         if ctx.storage.get("force_layer5_failed_gate"):
@@ -242,14 +484,18 @@ class Layer6Stage(Stage):
         
         parent_hash = None
         if ctx.manifest_path.exists():
-            with open(ctx.manifest_path, 'r', encoding='utf-8') as f:
-                manifest = json.load(f)
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path) as manifest:
                 parent_hash = manifest.get("artifacts", {}).get("layer5", {}).get("hash")
                 
         # Normal write (Substage E)
         payload = {"layer": 6, "payload": "completed"}
-        write_atomic_artifact(root, "layer6", ctx.run_id, payload, parent_hash)
-        return True
+        try:
+            write_atomic_artifact(root, "layer6", ctx.run_id, payload, parent_hash)
+            return True
+        except ValueError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
 
 class MetaVerifyStage(Stage):
     name = "MetaVerify"
@@ -263,25 +509,27 @@ class MetaVerifyStage(Stage):
         if ctx.storage.get("force_meta_verify_tamper"):
             tamper_file = root / "Artifacts" / "layer6.json"
             if tamper_file.exists():
-                with open(tamper_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                from .lock import locked_read, locked_write
+                with locked_read(tamper_file) as data:
+                    pass
                 data["payload"] = "tampered"
-                with open(tamper_file, 'w', encoding='utf-8') as f:
-                    json.dump(data, f)
+                with locked_write(tamper_file, data):
+                    pass
         
         # Test 2: Gap in pointer chain
         if ctx.storage.get("force_meta_verify_gap"):
             ledger_path = root / "Artifacts" / "Artifact_Ledger.json"
             if ledger_path.exists():
-                with open(ledger_path, 'r', encoding='utf-8') as f:
-                    ledger = json.load(f)
+                from .lock import locked_read, locked_write
+                with locked_read(ledger_path) as ledger:
+                    pass
                 # Find layer6 and break its parent_hash
                 for e in reversed(ledger):
                     if e["artifact"] == "layer6" and e["run_id"] == ctx.run_id:
                         e["parent_hash"] = "broken_hash"
                         break
-                with open(ledger_path, 'w', encoding='utf-8') as f:
-                    json.dump(ledger, f, indent=2)
+                with locked_write(ledger_path, ledger):
+                    pass
 
         success, code = verify_integrity(root, ctx.run_id, ctx.logger)
         ctx.storage["meta_verify_code"] = code
@@ -303,59 +551,84 @@ class SaveStage(Stage):
 class ArchiveStage(Stage):
     name = "Archive"
     def run(self, ctx: PipelineContext) -> bool:
-        import shutil
-        import stat
-        import json
-        import os
+        try:
+            import shutil
+            import stat
+            import os
+
+            root = ctx.manifest_path.parent.parent
+            archive_dir = root / "Archives" / f"Run_{ctx.run_id}"
         
-        root = ctx.manifest_path.parent.parent
-        archive_dir = root / "Archives" / f"Run_{ctx.run_id}"
-        
-        if archive_dir.exists():
-            ctx.logger.log(self.name, "WARNING", f"Archive directory {archive_dir} already exists, aborting to prevent overwrite.")
-            return False
+            if archive_dir.exists():
+                ctx.logger.log(self.name, "WARNING", f"Archive directory {archive_dir} already exists, aborting to prevent overwrite.")
+                return False
             
-        archive_dir.mkdir(parents=True, exist_ok=True)
+            archive_dir.mkdir(parents=True, exist_ok=True)
         
         # 1. Copy Artifacts/
-        artifacts_src = root / "Artifacts"
-        artifacts_dest = archive_dir / "Artifacts"
-        if artifacts_src.exists():
-            shutil.copytree(artifacts_src, artifacts_dest, ignore=shutil.ignore_patterns('*.lock', '*.tmp'))
+            artifacts_src = root / "Artifacts"
+            artifacts_dest = archive_dir / "Artifacts"
+            if artifacts_src.exists():
+                for source in artifacts_src.rglob("*"):
+                    if not source.is_file() or source.suffix in {".lock", ".tmp"}:
+                        continue
+                    relative = source.relative_to(artifacts_src)
+                    from .lock import locked_read, locked_write
+                    with locked_read(source, parse_json=False) as content:
+                        if content is not None:
+                            with locked_write(artifacts_dest / relative, content):
+                                pass
             
         # 2. Copy manifest
-        manifest_src = root / "Manifest" / f"manifest_{ctx.run_id}.json"
-        if manifest_src.exists():
-            shutil.copy2(manifest_src, archive_dir / f"manifest_{ctx.run_id}.json")
+            manifest_src = root / "Manifest" / f"manifest_{ctx.run_id}.json"
+            if manifest_src.exists():
+                from .lock import locked_read, locked_write
+                with locked_read(manifest_src, parse_json=False) as content:
+                    if content is not None:
+                        with locked_write(archive_dir / f"manifest_{ctx.run_id}.json", content):
+                            pass
             
         # 3. Pipeline_Ledger entry for this run
-        ledger_src = root / "Logs" / "Pipeline_Ledger.json"
-        if ledger_src.exists():
-            with open(ledger_src, 'r', encoding='utf-8') as f:
-                try:
-                    ledger = json.load(f)
-                    run_entry = next((e for e in ledger if e.get("run_id") == ctx.run_id), None)
-                    if run_entry:
-                        with open(archive_dir / "Pipeline_Ledger.json", 'w', encoding='utf-8') as out_f:
-                            json.dump([run_entry], out_f, indent=2)
-                except json.JSONDecodeError:
-                    pass
+            ledger_src = root / "Logs" / "Pipeline_Ledger.json"
+            if ledger_src.exists():
+                from .lock import locked_read, locked_write
+                with locked_read(ledger_src, default=[]) as ledger:
+                    if isinstance(ledger, list):
+                        run_entry = next((e for e in ledger if isinstance(e, dict) and e.get("run_id") == ctx.run_id), None)
+                    else:
+                        run_entry = None
+                if run_entry:
+                    with locked_write(archive_dir / "Pipeline_Ledger.json", [run_entry]):
+                        pass
                     
         # 4. Copy BUILD_REPORT.md
-        build_report_src = root / "BUILD_REPORT.md"
-        if build_report_src.exists():
-            shutil.copy2(build_report_src, archive_dir / "BUILD_REPORT.md")
+            build_report_src = root / "BUILD_REPORT.md"
+            if build_report_src.exists():
+                from .lock import locked_read, locked_write
+                with locked_read(build_report_src, parse_json=False) as content:
+                    if content is not None:
+                        with locked_write(archive_dir / "BUILD_REPORT.md", content):
+                            pass
             
         # Set entire copy to read-only
-        def set_readonly(path):
-            os.chmod(path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH) # 0o444
+            def set_readonly(path):
+                try:
+                    os.chmod(path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+                except OSError:
+                    pass
             
-        for dirpath, dirnames, filenames in os.walk(archive_dir):
-            set_readonly(dirpath)
-            for filename in filenames:
-                set_readonly(os.path.join(dirpath, filename))
-                
-        return True
+            for dirpath, dirnames, filenames in os.walk(archive_dir):
+                set_readonly(dirpath)
+                for filename in filenames:
+                    set_readonly(os.path.join(dirpath, filename))
+
+            return True
+        except (TimeoutError, OSError) as exc:
+            ctx.logger.log(self.name, "ERROR", f"Shared-file access failed: {exc}")
+            return False
+        except Exception as exc:
+            ctx.logger.log(self.name, "ERROR", f"Archive failed: {exc}")
+            return False
 
 class PipelineLedgerStage(Stage):
     name = "PipelineLedger"
@@ -386,8 +659,7 @@ class BuildReportStage(Stage):
     def run(self, ctx: PipelineContext) -> bool:
         from .report import generate_build_report
         root = ctx.manifest_path.parent.parent
-        generate_build_report(root, ctx.run_id)
-        return True
+        return generate_build_report(root, ctx.run_id, ctx.logger)
 
 class Pipeline:
     def __init__(self):
@@ -395,8 +667,10 @@ class Pipeline:
         from .checkpoint import CheckpointStage
         self.stages: List[Stage] = [
             IngestStage(),
+            FreezeBoundaryStage(),
             ValidateL1Stage(),
             ValidateL2Stage(),
+            ConfidencePropagationStage(),
             ValidateL3Stage(),
             ValidateL4_1Stage(),
             ValidateL4_2Stage(),
@@ -422,7 +696,14 @@ class Pipeline:
         
         for idx, stage in enumerate(self.stages):
             ctx.logger.log(stage.name, "STARTING")
-            success = stage.run(ctx)
+            try:
+                success = stage.run(ctx)
+            except (TimeoutError, OSError) as exc:
+                ctx.logger.log(stage.name, "ERROR", f"Shared-file access failed: {exc}")
+                success = False
+            except Exception as exc:
+                ctx.logger.log(stage.name, "ERROR", f"Stage failed with exception: {exc}")
+                success = False
             if not success:
                 ctx.logger.log(stage.name, "FAILED")
                 ctx.errors.append(f"{stage.name} failed")
@@ -436,14 +717,15 @@ class Pipeline:
                 
                 if manifest_path.exists() and ledger_path.exists():
                     try:
-                        with open(manifest_path, 'r', encoding='utf-8') as f:
-                            m = json.load(f)
-                        with open(ledger_path, 'r', encoding='utf-8') as f:
-                            l = json.load(f)
-                        if m and l:
+                        from .lock import locked_read
+                        with locked_read(manifest_path) as m:
+                            pass
+                        with locked_read(ledger_path) as l:
+                            pass
+                        if m and l and isinstance(l, list) and isinstance(m, dict):
                             # Just a simple validation: see if last entry hash matches manifest
-                            last_art = l[-1].get("artifact")
-                            last_hash = l[-1].get("hash")
+                            last_art = l[-1].get("artifact") if l else None
+                            last_hash = l[-1].get("hash") if l else None
                             if last_art and m.get("artifacts", {}).get(last_art, {}).get("hash") != last_hash:
                                 hash_valid = False
                     except Exception:
@@ -459,13 +741,20 @@ class Pipeline:
                     else:
                         ctx.logger.log("Rollback", "PASSED")
                         
-                ctx.storage["pipeline_status"] = "ROLLED_BACK" if 1 <= idx <= 12 else "FAIL"
+                if "pipeline_status" not in ctx.storage:
+                    ctx.storage["pipeline_status"] = "ROLLED_BACK" if 1 <= idx <= 12 else "FAIL"
                 
                 # Write to pipeline ledger (Step 16 / Index 15)
-                self.stages[15].run(ctx)
+                try:
+                    self.stages[15].run(ctx)
+                except Exception as exc:
+                    ctx.logger.log("PipelineLedger", "ERROR", f"Shared-file access failed: {exc}")
                 
                 # Generate build report (Step 17 / Index 16)
-                self.stages[16].run(ctx)
+                try:
+                    self.stages[16].run(ctx)
+                except Exception as exc:
+                    ctx.logger.log("BuildReport", "ERROR", f"Shared-file access failed: {exc}")
                 
                 return stage.failure_code(ctx)
             ctx.logger.log(stage.name, "PASSED")

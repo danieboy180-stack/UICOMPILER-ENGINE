@@ -4,7 +4,8 @@ import hashlib
 import datetime
 from pathlib import Path
 from typing import Any
-from .lock import simple_file_lock
+import uuid
+from .lock import locked_read, locked_write, simple_file_lock
 
 def write_atomic_artifact(
     root: Path,
@@ -25,17 +26,22 @@ def write_atomic_artifact(
         data_hash = hashlib.sha256(data_str.encode('utf-8')).hexdigest()
         
         manifest = {}
-        if manifest_path.exists():
-            with open(manifest_path, 'r', encoding='utf-8') as f:
-                manifest = json.load(f)
+        with locked_read(manifest_path, default={}) as data:
+            manifest = data
         
         ledger = []
-        if ledger_path.exists():
-            with open(ledger_path, 'r', encoding='utf-8') as f:
-                try:
-                    ledger = json.load(f)
-                except json.JSONDecodeError:
-                    pass
+        with locked_read(ledger_path, default=[]) as data:
+            ledger = data if isinstance(data, list) else []
+            
+        if parent_hash:
+            # Check if parent_hash exists in the ledger for this run
+            parent_found = False
+            for e in reversed(ledger):
+                if e.get("run_id") == run_id and e.get("hash") == parent_hash:
+                    parent_found = True
+                    break
+            if not parent_found:
+                raise ValueError(f"Hash chain broken: parent_hash {parent_hash} not found in ledger for run {run_id}")
                 
         manifest.setdefault("artifacts", {})[artifact_name] = {
             "hash": data_hash,
@@ -53,20 +59,20 @@ def write_atomic_artifact(
             "status": "written",
         })
         
-        tmp_artifact = artifact_path.with_suffix('.tmp')
-        tmp_manifest = manifest_path.with_suffix('.tmp')
-        tmp_ledger = ledger_path.with_suffix('.tmp')
+        uid = uuid.uuid4().hex
+        tmp_artifact = artifact_path.with_suffix(f'.{uid}.tmp')
+        tmp_manifest = manifest_path.with_suffix(f'.{uid}.tmp')
+        tmp_ledger = ledger_path.with_suffix(f'.{uid}.tmp')
         
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         
-        with open(tmp_artifact, 'w', encoding='utf-8') as f: json.dump(payload, f)
-        with open(tmp_manifest, 'w', encoding='utf-8') as f: json.dump(manifest, f, indent=2)
-        with open(tmp_ledger, 'w', encoding='utf-8') as f: json.dump(ledger, f, indent=2)
-        
-        os.replace(tmp_artifact, artifact_path)
-        os.replace(tmp_manifest, manifest_path)
-        os.replace(tmp_ledger, ledger_path)
+        with locked_write(artifact_path, payload):
+            pass
+        with locked_write(manifest_path, manifest):
+            pass
+        with locked_write(ledger_path, ledger):
+            pass
 
 def record_failed_gate(
     root: Path,
@@ -78,12 +84,8 @@ def record_failed_gate(
     
     with simple_file_lock(ledger_path):
         ledger = []
-        if ledger_path.exists():
-            with open(ledger_path, 'r', encoding='utf-8') as f:
-                try:
-                    ledger = json.load(f)
-                except json.JSONDecodeError:
-                    pass
+        with locked_read(ledger_path, default=[]) as data:
+            ledger = data if isinstance(data, list) else []
                 
         ledger.append({
             "artifact": artifact_name,
@@ -96,9 +98,8 @@ def record_failed_gate(
         })
         
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_ledger = ledger_path.with_suffix('.tmp')
-        with open(tmp_ledger, 'w', encoding='utf-8') as f: json.dump(ledger, f, indent=2)
-        os.replace(tmp_ledger, ledger_path)
+        with locked_write(ledger_path, ledger):
+            pass
 
 def write_pipeline_ledger(
     root: Path,
@@ -116,12 +117,8 @@ def write_pipeline_ledger(
         pl_path.parent.mkdir(parents=True, exist_ok=True)
         
         ledger = []
-        if pl_path.exists():
-            with open(pl_path, 'r', encoding='utf-8') as f:
-                try:
-                    ledger = json.load(f)
-                except json.JSONDecodeError:
-                    pass
+        with locked_read(pl_path, default=[]) as data:
+            ledger = data if isinstance(data, list) else []
                 
         entry = {
             "run_id": run_id,
@@ -138,6 +135,5 @@ def write_pipeline_ledger(
         
         ledger.append(entry)
         
-        tmp_pl = pl_path.with_suffix('.tmp')
-        with open(tmp_pl, 'w', encoding='utf-8') as f: json.dump(ledger, f, indent=2)
-        os.replace(tmp_pl, pl_path)
+        with locked_write(pl_path, ledger):
+            pass

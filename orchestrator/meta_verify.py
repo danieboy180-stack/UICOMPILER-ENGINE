@@ -20,10 +20,11 @@ def verify_integrity(root: Path, run_id: str, logger: RunLogger) -> Tuple[bool, 
         logger.log("MetaVerify", "ERROR", "Missing manifest or ledger")
         return False, EXIT_30
         
-    with open(manifest_path, 'r', encoding='utf-8') as f:
-        manifest = json.load(f)
-    with open(ledger_path, 'r', encoding='utf-8') as f:
-        ledger = json.load(f)
+    from .lock import locked_read
+    with locked_read(manifest_path) as manifest:
+        pass
+    with locked_read(ledger_path) as ledger:
+        pass
         
     run_entries = [e for e in ledger if e.get("run_id") == run_id and e.get("status") == "written"]
     
@@ -40,8 +41,8 @@ def verify_integrity(root: Path, run_id: str, logger: RunLogger) -> Tuple[bool, 
             logger.log("MetaVerify", "ERROR", f"Artifact missing on disk: {artifact_name}")
             return False, EXIT_30
             
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        with locked_read(file_path) as data:
+            pass
             data_str = json.dumps(data, sort_keys=True, separators=(",", ":"))
             h = hashlib.sha256(data_str.encode('utf-8')).hexdigest()
             computed_hashes[artifact_name] = h
