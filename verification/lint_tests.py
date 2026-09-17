@@ -69,8 +69,22 @@ def check_file(path: Path) -> list:
 
 def main():
     root = Path.cwd()
+
+    # Stage 7: also scan tests/spam/ so test_post_run_lint.py and all
+    # other spam-suite test files are covered by the lint gate.
     test_files = list(root.glob("test_*.py"))
-    
+    test_files += list((root / "tests" / "spam").glob("test_*.py"))
+
+    # De-duplicate (in case cwd is already inside tests/spam)
+    seen = set()
+    unique_files = []
+    for tf in test_files:
+        key = tf.resolve()
+        if key not in seen:
+            seen.add(key)
+            unique_files.append(tf)
+    test_files = unique_files
+
     failed = False
     for tf in test_files:
         errs = check_file(tf)
@@ -79,7 +93,7 @@ def main():
             print(f"FAIL: {tf.name}")
             for e in errs:
                 print(f"  - {e}")
-                
+
     if failed:
         sys.exit(1)
     else:

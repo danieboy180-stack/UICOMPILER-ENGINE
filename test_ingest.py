@@ -21,13 +21,22 @@ def run(root: Path) -> subprocess.CompletedProcess[str]:
 def write_inbox(root: Path, filename: str, value: object) -> None:
     inbox = root / "Python_Inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    (inbox / filename).write_text(json.dumps(value), encoding="utf-8")
+    if isinstance(value, str):
+        (inbox / filename).write_text(value, encoding="utf-8")
+    else:
+        (inbox / filename).write_text(json.dumps(value), encoding="utf-8")
 
 
 def test_malformed_bundle() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        write_inbox(root, "layer12_bundle.json", {"layer": 12})
+        content = """<LAYER1_OUTPUT>
+{"layer": 12}
+</LAYER1_OUTPUT>
+<LAYER2_OUTPUT>
+{}
+</LAYER2_OUTPUT>"""
+        write_inbox(root, "layer12_bundle.txt", content)
         result = run(root)
         assert result.returncode == 10
         assert not (root / "Artifacts").exists()
@@ -36,28 +45,39 @@ def test_malformed_bundle() -> None:
 def test_valid_bundle() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        write_inbox(root, "layer12_bundle.json", {"schema_version": "2.1", "project_id": "test_proj", "layer": 12, "payload": {"x": 1}})
+        content = """<LAYER1_OUTPUT>
+{"schema_version": "2.1", "project_id": "test_proj", "layer": 12, "payload": {"x": 1}}
+</LAYER1_OUTPUT>
+<LAYER2_OUTPUT>
+{}
+</LAYER2_OUTPUT>"""
+        write_inbox(root, "layer12_bundle.txt", content)
         result = run(root)
+        print(result.stdout)
         assert result.returncode == 0, result.stderr
         
         # Verify it was moved
-        assert not (root / "Python_Inbox" / "layer12_bundle.json").exists()
-        assert (root / "Artifacts" / "layer12_bundle.json").exists()
+        assert not (root / "Python_Inbox" / "layer12_bundle.txt").exists()
+        assert (root / "Artifacts" / "layer1_ccir.json").exists()
         
         from verification.receipt import record_verification
         record_verification("test_ingest", "Valid bundle ingested", str(result.stdout) + "\n" + str(result.stderr) + "\n" + "\n".join(["padding"]*10), True)
-        artifact = json.loads((root / "Artifacts" / "layer12_bundle.json").read_text())
+        from orchestrator.lock import locked_read
+        with locked_read(root / "Artifacts" / "layer1_ccir.json") as artifact:
+            pass
         manifest_files = list((root / "Manifest").glob("manifest_*.json"))
-        manifest = json.loads(manifest_files[0].read_text())
-        ledger = json.loads((root / "Artifacts" / "Artifact_Ledger.json").read_text())
+        with locked_read(manifest_files[0]) as manifest:
+            pass
+        with locked_read(root / "Artifacts" / "Artifact_Ledger.json") as ledger:
+            pass
         
         assert artifact["payload"] == {"x": 1}
-        assert ledger[0]["artifact"] == "layer12_bundle"
-        assert manifest["artifacts"]["layer12_bundle"]["hash"] == ledger[0]["hash"] == __import__("hashlib").sha256(
+        assert ledger[0]["artifact"] == "layer1_ccir"
+        assert manifest["artifacts"]["layer1_ccir"]["hash"] == ledger[0]["hash"] == __import__("hashlib").sha256(
             json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         assert manifest["next_layer"] == 13
-        assert list((root / "Python_Output").rglob("layer12_bundle.json"))
+        assert list((root / "Python_Output").rglob("layer12_bundle.txt"))
 
 
 def test_disallowed_filename_is_ignored() -> None:

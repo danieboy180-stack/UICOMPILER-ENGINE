@@ -3,13 +3,20 @@ import json
 import shutil
 from pathlib import Path
 from orchestrator import Pipeline, PipelineContext, RunLogger
+from orchestrator.lock import locked_read, locked_write
 
 def setup_inbox(root: Path):
     inbox = root / "Python_Inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    bundle = inbox / "layer12_bundle.json"
-    with open(bundle, "w", encoding="utf-8") as f:
-        json.dump({"layer": 12, "payload": {"dummy": "data"}}, f)
+    bundle = inbox / "layer12_bundle.txt"
+    content = """<LAYER1_OUTPUT>
+{"schema_version": "2.1", "project_id": "test_proj", "layer": 12, "payload": {"dummy": "data"}}
+</LAYER1_OUTPUT>
+<LAYER2_OUTPUT>
+{}
+</LAYER2_OUTPUT>"""
+    with locked_write(bundle, content):
+        pass
 
 def run_test():
     root = Path.cwd()
@@ -27,8 +34,8 @@ def run_test():
     res1 = pipeline.run(ctx1)
     print(f"Exit code: {res1}")
     if pl_path.exists():
-        with open(pl_path, 'r', encoding='utf-8') as f:
-            ledger = json.load(f)
+        with locked_read(pl_path) as ledger:
+            pass
             t1_entries = [e for e in ledger if e.get("run_id") == ctx1.run_id]
             if t1_entries:
                 print(f"Test 1 Pipeline Ledger status: {t1_entries[-1].get('status')}")
@@ -78,8 +85,8 @@ def run_test():
     
     # Check if Ledger has ROLLED_BACK entry
     if pl_path.exists():
-        with open(pl_path, 'r', encoding='utf-8') as f:
-            ledger = json.load(f)
+        with locked_read(pl_path) as ledger:
+            pass
             t4_entries = [e for e in ledger if e.get("run_id") == ctx4.run_id]
             if t4_entries:
                 last_entry = t4_entries[-1]
@@ -88,7 +95,7 @@ def run_test():
             
     # Verify hash match for manifest.json and Artifact_Ledger.json
     chk_dir = root / "Checkpoints" / ctx4.run_id / "pre_layer5"
-    m1, m2 = file_hash(manifest_path), file_hash(chk_dir / "manifest.json")
+    m1, m2 = file_hash(ctx4.manifest_path), file_hash(chk_dir / "manifest.json")
     print(f"Manifest hash match: {m1 == m2 and m1 is not None}")
 
     # O8 Verification: Build report on failure
@@ -109,14 +116,14 @@ def run_test():
     
     artifact_ledger_path = root / "Artifacts" / "Artifact_Ledger.json"
     if artifact_ledger_path.exists():
-        with open(artifact_ledger_path, 'r', encoding='utf-8') as f:
-            ledger = json.load(f)
+        with locked_read(artifact_ledger_path) as ledger:
+            pass
             l5_entries = [e for e in ledger if e.get("artifact") == "layer5" and e.get("run_id") == ctx5.run_id]
             print(f"Layer5 Ledger Entries Count: {len(l5_entries)}")
             if l5_entries:
                 l5_ledger_hash = l5_entries[-1].get("hash")
-                with open(manifest_path, 'r', encoding='utf-8') as mf:
-                    manifest = json.load(mf)
+                with locked_read(ctx5.manifest_path) as manifest:
+                    pass
                     l5_manifest_hash = manifest.get("artifacts", {}).get("layer5", {}).get("hash")
                 print(f"Ledger hash == Manifest hash: {l5_ledger_hash == l5_manifest_hash and l5_ledger_hash is not None}")
                 print(f"Status in ledger: {l5_entries[-1].get('status')}")
@@ -129,8 +136,8 @@ def run_test():
     print(f"Test 6 used run_id: {ctx6.run_id}")
     
     if artifact_ledger_path.exists():
-        with open(artifact_ledger_path, 'r', encoding='utf-8') as f:
-            ledger = json.load(f)
+        with locked_read(artifact_ledger_path) as ledger:
+            pass
             l5_entries_fail = [e for e in ledger if e.get("artifact") == "layer5" and e.get("run_id") == ctx6.run_id]
             print(f"Failed gate ledger status: {l5_entries_fail[-1].get('status') if l5_entries_fail else 'None'}")
             

@@ -27,9 +27,9 @@ def main():
         print("\nCI REJECTED: Verification_Ledger.json not found. No verification receipts recorded.")
         sys.exit(1)
         
-    import json
-    with open(ledger_path, 'r', encoding='utf-8') as f:
-        lines = f.read().strip().splitlines()
+    from orchestrator.lock import locked_read
+    with locked_read(ledger_path, default="", parse_json=False) as content:
+        lines = content.strip().splitlines()
         
     if not lines:
         print("\nCI REJECTED: Verification Ledger is empty.")

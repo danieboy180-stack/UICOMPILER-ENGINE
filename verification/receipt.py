@@ -4,29 +4,6 @@ import time
 import os
 from pathlib import Path
 
-# Handle Windows / Unix lock compatibility if needed, but since it's append mode we can just write atomically if we want
-# Wait, fcntl doesn't exist on windows.
-import sys
-if sys.platform == "win32":
-    import msvcrt
-    def lock_file(f):
-        # msvcrt.locking not strictly needed for append in most simple cases but let's use it
-        try:
-            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-        except OSError:
-            pass
-    def unlock_file(f):
-        try:
-            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-        except OSError:
-            pass
-else:
-    import fcntl
-    def lock_file(f):
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-    def unlock_file(f):
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
 def record_verification(stage_id: str, claim: str, raw_output: str, passed: bool) -> None:
     if passed:
         lines = raw_output.strip().splitlines()
@@ -47,6 +24,7 @@ def record_verification(stage_id: str, claim: str, raw_output: str, passed: bool
     
     entry = {
         "stage_id": stage_id,
+        "verification_session_id": os.environ.get("VERIFICATION_SESSION_ID"),
         "claim": claim,
         "raw_output_hash": out_hash,
         "raw_output_excerpt": excerpt,
@@ -60,10 +38,5 @@ def record_verification(stage_id: str, claim: str, raw_output: str, passed: bool
     
     ledger_path = logs_dir / "Verification_Ledger.json"
     
-    with open(ledger_path, "a", encoding="utf-8") as f:
-        lock_file(f)
-        try:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
-            f.flush()
-        finally:
-            unlock_file(f)
+    from orchestrator.lock import locked_append
+    locked_append(ledger_path, json.dumps(entry, sort_keys=True) + "\n")

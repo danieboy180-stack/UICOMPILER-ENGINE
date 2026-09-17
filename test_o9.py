@@ -5,6 +5,7 @@ import time
 import threading
 from pathlib import Path
 from orchestrator.orchestrator import Pipeline, PipelineContext
+from orchestrator.lock import locked_read, locked_write
 
 def setup_inbox(root: Path, content_str: str = None):
     inbox = root / "Python_Inbox"
@@ -13,10 +14,10 @@ def setup_inbox(root: Path, content_str: str = None):
     # clean out old files
     for f in inbox.glob("*"): f.unlink()
     
-    bundle_path = inbox / "layer12_bundle.json"
+    bundle_path = inbox / "layer12_bundle.txt"
     content = content_str or '{"layer": 12, "schema_version": "2.1", "payload": {"data": "test"}}'
-    with open(bundle_path, 'w', encoding='utf-8') as f:
-        f.write(content)
+    with locked_write(bundle_path, content):
+        pass
         
     return bundle_path
 
@@ -33,7 +34,9 @@ def run_o9_tests():
     ctx_sec.logger.log("Debug", "INFO", "And key is sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")
     log_file = root / "Logs" / "Run_sec_run.jsonl"
     if log_file.exists():
-        lines = [ln for ln in log_file.read_text(encoding='utf-8').split('\n') if ln.strip()]
+        with locked_read(log_file, default="", parse_json=False) as log_content:
+            pass
+        lines = [ln for ln in log_content.split('\n') if ln.strip()]
         if len(lines) >= 2:
             try:
                 entry1 = json.loads(lines[-2])
@@ -67,7 +70,8 @@ def run_o9_tests():
     # 5. ORCHESTRATOR-LEVEL CRASH RECOVERY
     print("\n--- Testing Gap 5: Crash Recovery ---")
     lock_file = root / "Manifest" / "manifest.json.lock"
-    with open(lock_file, 'w') as f: f.write("deadlock")
+    with locked_write(lock_file, "deadlock"):
+        pass
     # Make the lock stale
     os.utime(lock_file, (time.time() - 20, time.time() - 20))
     setup_inbox(root)

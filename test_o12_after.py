@@ -5,16 +5,17 @@ import time
 import threading
 from pathlib import Path
 from orchestrator.orchestrator import Pipeline, PipelineContext
+from orchestrator.lock import locked_write
 import shutil
 
 def setup_inbox(root: Path, content_str: str = None):
     inbox = root / "Python_Inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     for f in inbox.glob("*"): f.unlink()
-    bundle_path = inbox / "layer12_bundle.json"
+    bundle_path = inbox / "layer12_bundle.txt"
     content = content_str or '{"layer": 12, "schema_version": "2.1", "payload": {"data": "test"}}'
-    with open(bundle_path, 'w', encoding='utf-8') as f:
-        f.write(content)
+    with locked_write(bundle_path, content):
+        pass
     return bundle_path
 
 def cleanup_manifests(root: Path):
@@ -59,11 +60,11 @@ def run_after_tests():
         # Simulate ingest creating the isolated manifest manually to avoid inbox race
         ctx = PipelineContext(run_id=run_id, manifest_path=root / "Manifest" / f"manifest_{run_id}.json")
         ctx.manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(ctx.manifest_path, 'w') as f:
-            json.dump({"next_layer": None, "artifacts": {"layer12_bundle": {"hash": bundle_hash}}}, f)
+        with locked_write(ctx.manifest_path, {"next_layer": None, "artifacts": {"layer1_ccir": {"hash": bundle_hash}}}):
+            pass
             
         from orchestrator.ledger import write_atomic_artifact
-        write_atomic_artifact(root, "layer12_bundle", run_id, {"data": bundle_hash}, None)
+        write_atomic_artifact(root, "layer1_ccir", run_id, {"data": bundle_hash}, None)
         
         # Now run pipeline, skipping ingest since we simulated it
         pipeline = Pipeline()
@@ -82,7 +83,8 @@ def run_after_tests():
     if ledger_lock.exists():
         ledger_lock.unlink()
     # Create a stale lock on Artifact_Ledger (which is now what locks)
-    with open(ledger_lock, 'w') as f: f.write("deadlock")
+    with locked_write(ledger_lock, "deadlock"):
+        pass
     os.utime(ledger_lock, (time.time() - 20, time.time() - 20)) # Stale
     
     setup_inbox(root, '{"layer": 12, "schema_version": "2.1", "project_id": "crash_proj", "payload": {"data": "crash_test"}}')

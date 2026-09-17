@@ -18,10 +18,17 @@ def generate_bundles():
     def write_bundle(name, content, is_json=True):
         path = inbox / name
         if is_json and isinstance(content, (dict, list)):
-            path.write_text(json.dumps(content))
+            text = f"<LAYER1_OUTPUT>\n{json.dumps(content)}\n</LAYER1_OUTPUT>\n<LAYER2_OUTPUT>\n{{}}\n</LAYER2_OUTPUT>\n<MANIFEST_UPDATE>\n{{}}\n</MANIFEST_UPDATE>\n<REPORT>\n</REPORT>"
+            if path.suffix == '.json':
+                path = path.with_suffix('.txt')
+            path.write_text(text, encoding='utf-8')
         elif isinstance(content, str):
+            if path.suffix == '.json':
+                path = path.with_suffix('.txt')
             path.write_text(content, encoding='utf-8', errors='ignore')
         else:
+            if path.suffix == '.json':
+                path = path.with_suffix('.txt')
             path.write_bytes(content)
 
     # a. Valid bundles (20+)

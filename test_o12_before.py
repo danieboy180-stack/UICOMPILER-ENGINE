@@ -5,15 +5,16 @@ import time
 import threading
 from pathlib import Path
 from orchestrator.orchestrator import Pipeline, PipelineContext
+from orchestrator.lock import locked_write
 
 def setup_inbox(root: Path, content_str: str = None):
     inbox = root / "Python_Inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     for f in inbox.glob("*"): f.unlink()
-    bundle_path = inbox / "layer12_bundle.json"
+    bundle_path = inbox / "layer12_bundle.txt"
     content = content_str or '{"layer": 12, "schema_version": "2.1", "payload": {"data": "test"}}'
-    with open(bundle_path, 'w', encoding='utf-8') as f:
-        f.write(content)
+    with locked_write(bundle_path, content):
+        pass
     return bundle_path
 
 def run_before_tests():
@@ -39,7 +40,8 @@ def run_before_tests():
     # Bug 2: Crash Recovery Bypass
     print("\n--- BUG 2 (BEFORE): Crash Recovery Silent Bypass ---")
     lock_file = root / "Manifest" / "manifest.json.lock"
-    with open(lock_file, 'w') as f: f.write("deadlock")
+    with locked_write(lock_file, "deadlock"):
+        pass
     os.utime(lock_file, (time.time() - 20, time.time() - 20)) # Stale
     setup_inbox(root)
     ctx_crash = PipelineContext(run_id="crash_before_run", manifest_path=manifest_path)
