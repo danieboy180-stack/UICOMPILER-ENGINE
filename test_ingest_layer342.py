@@ -829,6 +829,110 @@ def test_layer4_2_validation_fail():
         assert (root / "Python_Inbox" / "layer342_bundle.txt").exists()
 
 
+def test_real_fused_v2_1_schema_version() -> None:
+    """Real Layer 3+4.1+4.2 v1.1 bundle with schema_version 'v2.1' only in MANIFEST_UPDATE/REPORT."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        manifest_path, manifest_data, l1_h, l2_h = _setup_run(root, "run_v21_real")
+
+        # Layer bodies legitimately have NO schema_version in real fused output
+        l3_body = {
+            "visuals": [{"id": "v1", "style": {"color": "#111"}}],
+            "VALIDATION_GATE": {"gate_result": "pass"}
+        }
+        l4_1_body = {
+            "root": {"id": "r1", "layout": {"layout_type": "flex_col"}, "children": []},
+            "VALIDATION_GATE": {"gate_result": "pass"}
+        }
+        l4_2_body = {
+            "root_node": {"id": "r1", "type": "container", "children": []},
+            "validation": {"status": "pass"},
+            "VALIDATION_GATE": {"gate_result": "pass"}
+        }
+
+        h3 = _hash(l3_body)
+        h4_1 = _hash(l4_1_body)
+        h4_2 = _hash(l4_2_body)
+
+        pipe_hash = compute_pipeline_hash([
+            ("layer3", l2_h, h3, l2_h),
+            ("layer4_1", h3, h4_1, h3),
+            ("layer4_2", h4_1, h4_2, h4_1),
+        ])
+
+        manifest_update = {
+            "schema_version": "v2.1",
+            "layer3_input_hash": l2_h,
+            "layer3_output_hash": h3,
+            "layer4_1_input_hash": h3,
+            "layer4_1_output_hash": h4_1,
+            "layer4_2_input_hash": h4_1,
+            "layer4_2_output_hash": h4_2,
+            "pipeline_hash": pipe_hash,
+        }
+
+        report = {
+            "schema_version": "v2.1",
+            "layers": {
+                "layer3": {"status": "pass"},
+                "layer4_1": {"status": "pass"},
+                "layer4_2": {"status": "pass"},
+            }
+        }
+
+        bundle_content = f"""<LAYER3_OUTPUT>
+{json.dumps(l3_body, indent=2)}
+</LAYER3_OUTPUT>
+<LAYER4_1_OUTPUT>
+{json.dumps(l4_1_body, indent=2)}
+</LAYER4_1_OUTPUT>
+<LAYER4_2_OUTPUT>
+{json.dumps(l4_2_body, indent=2)}
+</LAYER4_2_OUTPUT>
+<MANIFEST_UPDATE>
+{json.dumps(manifest_update, indent=2)}
+</MANIFEST_UPDATE>
+<REPORT>
+{json.dumps(report, indent=2)}
+</REPORT>"""
+
+        _write_inbox(root, "layer342_bundle.txt", bundle_content)
+        code = ingest_layer342.ingest(root)
+        assert code == EXIT_OK, f"Expected EXIT_OK, got {code}"
+        assert (root / "Artifacts" / "layer3_visual_ir.json").exists()
+        assert (root / "Artifacts" / "layer4_1_semantic_ir.json").exists()
+        assert (root / "Artifacts" / "layer4_2_execution_ir.json").exists()
+
+
+def test_unsupported_schema_version_rejected() -> None:
+    """Bundle with unsupported schema_version ('v1.0') is rejected with EXIT_10."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        manifest_path, manifest_data, l1_h, l2_h = _setup_run(root, "run_bad_ver")
+
+        manifest_update = {
+            "schema_version": "v1.0",
+            "layer3_input_hash": l2_h,
+            "layer3_output_hash": "dummy",
+        }
+        report = {"schema_version": "v1.0"}
+
+        bundle_content = f"""<LAYER3_OUTPUT>
+{{}}
+</LAYER3_OUTPUT>
+<MANIFEST_UPDATE>
+{json.dumps(manifest_update, indent=2)}
+</MANIFEST_UPDATE>
+<REPORT>
+{json.dumps(report, indent=2)}
+</REPORT>"""
+
+        _write_inbox(root, "layer342_bundle.txt", bundle_content)
+        code = ingest_layer342.ingest(root)
+        assert code == EXIT_10, f"Expected EXIT_10, got {code}"
+        assert not (root / "Artifacts" / "layer3_visual_ir.json").exists()
+
+
 if __name__ == "__main__":
     test_valid_layer3_pass()
     print("PASS: test_valid_layer3_pass")
@@ -852,4 +956,8 @@ if __name__ == "__main__":
     print("PASS: test_pipeline_hash_mismatch_fails")
     test_layer4_2_validation_fail()
     print("PASS: test_layer4_2_validation_fail")
+    test_real_fused_v2_1_schema_version()
+    print("PASS: test_real_fused_v2_1_schema_version")
+    test_unsupported_schema_version_rejected()
+    print("PASS: test_unsupported_schema_version_rejected")
     print("ALL TESTS PASSED!")

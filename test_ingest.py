@@ -90,7 +90,60 @@ def test_disallowed_filename_is_ignored() -> None:
         assert not (root / "Artifacts").exists()
 
 
+def test_real_fused_bundle_v2_1_in_manifest_update() -> None:
+    """Real fused prompt output places schema_version in MANIFEST_UPDATE/REPORT, not layer bodies."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        content = """<LAYER1_OUTPUT>
+{"project_id": "test_proj", "layer": 12, "candidates": [{"id": "c1", "bbox": {"x": 0, "y": 0, "w": 10, "h": 10}}]}
+</LAYER1_OUTPUT>
+<LAYER2_OUTPUT>
+{"semantics": [{"id": "c1", "role": "button"}]}
+</LAYER2_OUTPUT>
+<MANIFEST_UPDATE>
+{"schema_version": "v2.1", "pipeline_id": "pipe_v21"}
+</MANIFEST_UPDATE>
+<REPORT>
+{"schema_version": "v2.1", "status": "pass"}
+</REPORT>"""
+        write_inbox(root, "layer12_bundle.txt", content)
+        result = run(root)
+        assert result.returncode == 0, f"Failed with {result.stderr}, stdout: {result.stdout}"
+        assert (root / "Artifacts" / "layer1_ccir.json").exists()
+        assert (root / "Artifacts" / "layer2_csir.json").exists()
+
+
+def test_invalid_schema_version_rejected() -> None:
+    """Unsupported schema_version (e.g. 1.0) must be rejected with exit code 10 and not unlinked."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        content = """<LAYER1_OUTPUT>
+{"project_id": "test_proj"}
+</LAYER1_OUTPUT>
+<LAYER2_OUTPUT>
+{}
+</LAYER2_OUTPUT>
+<MANIFEST_UPDATE>
+{"schema_version": "1.0"}
+</MANIFEST_UPDATE>
+<REPORT>
+{"schema_version": "1.0"}
+</REPORT>"""
+        write_inbox(root, "layer12_bundle.txt", content)
+        result = run(root)
+        assert result.returncode == 10
+        assert "Unsupported schema version '1.0'" in result.stdout
+        # Inbox file must be preserved for inspection (fail-closed, not unlinked)
+        assert (root / "Python_Inbox" / "layer12_bundle.txt").exists()
+
+
 if __name__ == "__main__":
-    for test in (test_malformed_bundle, test_valid_bundle, test_disallowed_filename_is_ignored):
+    for test in (
+        test_malformed_bundle,
+        test_valid_bundle,
+        test_disallowed_filename_is_ignored,
+        test_real_fused_bundle_v2_1_in_manifest_update,
+        test_invalid_schema_version_rejected,
+    ):
         test()
         print(f"PASS {test.__name__}")

@@ -10,6 +10,11 @@ from .orchestrator import (
     ValidateL4_2Stage,
     SaveStage,
 )
+from .schema import (
+    extract_schema_version,
+    is_valid_schema_version,
+    VALID_SCHEMA_VERSIONS,
+)
 
 __all__ = [
     "Pipeline",
@@ -22,5 +27,8 @@ __all__ = [
     "Layer4_2Stage",
     "ValidateL4_2Stage",
     "SaveStage",
+    "extract_schema_version",
+    "is_valid_schema_version",
+    "VALID_SCHEMA_VERSIONS",
 ]
 

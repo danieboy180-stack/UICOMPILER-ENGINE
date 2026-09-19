@@ -12,7 +12,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ValidationError
 
@@ -21,8 +21,9 @@ EXIT_10 = 10
 ALLOWED_FILES = {"layer12_bundle.txt"}
 
 class Layer1CCIR(BaseModel):
-    schema_version: Literal["2.1"] = "2.1"
+    schema_version: Optional[str] = None
     project_id: str = "default_project"
+    model_config = {"extra": "allow"}
 
 def _model_validate(model: type[BaseModel], value: Any) -> BaseModel:
     validator = getattr(model, "model_validate", None)
@@ -112,6 +113,7 @@ def ingest(root: Path) -> int:
         return EXIT_OK
 
     original_name = selected.name
+    original_path = inbox / original_name
     processing_path = selected.with_name(f".{selected.name}.processing.{uuid.uuid4().hex}")
     try:
         os.rename(selected, processing_path)
@@ -119,34 +121,57 @@ def ingest(root: Path) -> int:
     except OSError:
         return EXIT_OK
 
-    from orchestrator.lock import safe_unlink
-    
+    def _restore_inbox():
+        try:
+            if selected.exists() and not original_path.exists():
+                os.replace(selected, original_path)
+        except Exception:
+            pass
+
     try:
         with selected.open("r", encoding="utf-8") as stream:
             raw_text = stream.read()
             
         l1_match = re.search(r'<LAYER1_OUTPUT>(.*?)</LAYER1_OUTPUT>', raw_text, re.DOTALL)
         l2_match = re.search(r'<LAYER2_OUTPUT>(.*?)</LAYER2_OUTPUT>', raw_text, re.DOTALL)
+        m_manifest = re.search(r'<MANIFEST_UPDATE>(.*?)</MANIFEST_UPDATE>', raw_text, re.DOTALL)
+        m_report = re.search(r'<REPORT>(.*?)</REPORT>', raw_text, re.DOTALL)
         
         if not l1_match or not l2_match:
             print("[Ingest] ERROR: Missing <LAYER1_OUTPUT> or <LAYER2_OUTPUT>")
-            safe_unlink(selected)
+            _restore_inbox()
             return EXIT_10
             
         layer1_raw = json.loads(l1_match.group(1).strip())
         layer2_raw = json.loads(l2_match.group(1).strip())
-        
-        # Gap 6: Schema versioning explicit check policy
-        if layer1_raw.get("schema_version") != "2.1":
-            print(f"[Ingest] ERROR: Unsupported schema version '{layer1_raw.get('schema_version')}'. Expected '2.1'.")
-            safe_unlink(selected)
+
+        manifest_update = None
+        if m_manifest:
+            try:
+                manifest_update = json.loads(m_manifest.group(1).strip())
+            except Exception:
+                pass
+
+        report_data = None
+        if m_report:
+            rep_text = m_report.group(1).strip()
+            try:
+                report_data = json.loads(rep_text)
+            except Exception:
+                report_data = rep_text
+
+        from orchestrator.schema import extract_schema_version, is_valid_schema_version
+        schema_ver = extract_schema_version(manifest_update, report_data, layer1_raw)
+        if not is_valid_schema_version(schema_ver):
+            print(f"[Ingest] ERROR: Unsupported schema version '{schema_ver}'. Expected '2.1' or 'v2.1'.")
+            _restore_inbox()
             return EXIT_10
             
         validated_l1 = _model_validate(Layer1CCIR, layer1_raw)
         
     except (OSError, json.JSONDecodeError, ValidationError, TypeError, ValueError) as e:
         print(f"[Ingest] Validation failed: {e}")
-        safe_unlink(selected)
+        _restore_inbox()
         return EXIT_10
 
     data1 = _model_dump(validated_l1)

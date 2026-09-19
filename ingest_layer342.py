@@ -12,7 +12,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ValidationError
 
@@ -22,17 +22,17 @@ ALLOWED_FILES = {"layer342_bundle.txt"}
 
 
 class Layer3VisualIR(BaseModel):
-    schema_version: Literal["2.1"] = "2.1"
+    schema_version: Optional[str] = None
     model_config = {"extra": "allow"}
 
 
 class Layer4_1SemanticIR(BaseModel):
-    schema_version: Literal["2.1"] = "2.1"
+    schema_version: Optional[str] = None
     model_config = {"extra": "allow"}
 
 
 class Layer4_2ExecutionIR(BaseModel):
-    schema_version: Literal["2.1"] = "2.1"
+    schema_version: Optional[str] = None
     model_config = {"extra": "allow"}
 
 
@@ -195,10 +195,34 @@ def _commit_outputs(root: Path, outputs: dict[Path, Any], run_id: str) -> None:
     else:
         for item in backups:
             safe_unlink(root / item["backup"])
+        safe_unlink(transaction_path)
+
+
 def _handle_halt(root: Path, selected: Path, run_id: str, force_clear_halted: bool) -> None:
+    """
+    DECISION / FAIL-CLOSED POLICY FOR HALTED BUNDLES:
+    By default, halted/failed bundles are kept in Python_Inbox/ so that developers or operators
+    can directly inspect the rejected payload, diagnose gate failures or hash mismatches, and
+    remediate without data loss. If --force-clear-halted is passed, the script explicitly moves
+    the failed bundle into Python_Output/runs/{run_id}/halted/ to clear the inbox.
+    """
+    if force_clear_halted:
+        halted_dir = root / "Python_Output" / "runs" / run_id / "halted"
+        halted_dir.mkdir(parents=True, exist_ok=True)
+        dest = halted_dir / selected.name
+        try:
+            shutil.move(str(selected), str(dest))
+            print(f"[IngestLayer342] --force-clear-halted: Moved halted bundle to {dest}")
+        except Exception as e:
+            print(f"[IngestLayer342] WARNING: Failed to move halted bundle {selected} to {dest}: {e}")
+    else:
+        # Default policy: keep in Python_Inbox/ for inspection and debugging
+        pass
+
 
 def ingest(root: Path, force_clear_halted: bool = False) -> int:
     root = root.resolve()
+    inbox = root / "Python_Inbox"
 
     # Only check allow-listed file; strictly do NOT glob-scan Python_Inbox
     selected = next((inbox / name for name in sorted(ALLOWED_FILES) if (inbox / name).is_file()), None)
@@ -283,6 +307,12 @@ def ingest(root: Path, force_clear_halted: bool = False) -> int:
 
     if not isinstance(manifest_update, dict):
         print("[IngestLayer342] ERROR: <MANIFEST_UPDATE> is not a JSON object.")
+        return EXIT_10
+
+    from orchestrator.schema import extract_schema_version, is_valid_schema_version
+    schema_ver = extract_schema_version(manifest_update, report_data, raw_text=raw_text)
+    if not is_valid_schema_version(schema_ver):
+        print(f"[IngestLayer342] ERROR: Unsupported schema version '{schema_ver}'. Expected '2.1' or 'v2.1'.")
         return EXIT_10
 
     # Extract declared hashes from MANIFEST_UPDATE top level
@@ -466,10 +496,6 @@ def ingest(root: Path, force_clear_halted: bool = False) -> int:
         return EXIT_10
 
     # Passing path for Layer 3:
-    if layer3_raw.get("schema_version") != "2.1":
-        print(f"[IngestLayer342] ERROR: Unsupported schema version '{layer3_raw.get('schema_version')}'. Expected '2.1'.")
-        return EXIT_10
-
     try:
         _model_validate(Layer3VisualIR, layer3_raw)
     except ValidationError as ve:
@@ -599,10 +625,6 @@ def ingest(root: Path, force_clear_halted: bool = False) -> int:
         return EXIT_10
 
     # Passing path for Layer 4.1:
-    if layer4_1_raw.get("schema_version") != "2.1":
-        print(f"[IngestLayer342] ERROR: Unsupported schema version '{layer4_1_raw.get('schema_version')}'. Expected '2.1'.")
-        return EXIT_10
-
     try:
         _model_validate(Layer4_1SemanticIR, layer4_1_raw)
     except ValidationError as ve:
@@ -736,10 +758,6 @@ def ingest(root: Path, force_clear_halted: bool = False) -> int:
         return EXIT_10
 
     # Passing path for Layer 4.2:
-    if layer4_2_raw.get("schema_version") != "2.1":
-        print(f"[IngestLayer342] ERROR: Unsupported schema version '{layer4_2_raw.get('schema_version')}'. Expected '2.1'.")
-        return EXIT_10
-
     try:
         _model_validate(Layer4_2ExecutionIR, layer4_2_raw)
     except ValidationError as ve:
@@ -825,4 +843,7 @@ def main() -> int:
     parser.add_argument("--force-clear-halted", action="store_true", help="Explicitly move halted/failed bundles to Python_Output/runs/{run_id}/halted/ instead of leaving in Python_Inbox/ for inspection")
     args = parser.parse_args()
     return ingest(args.root, force_clear_halted=args.force_clear_halted)
+
+
+if __name__ == "__main__":
     sys.exit(main())
