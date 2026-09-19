@@ -10,7 +10,11 @@ from orchestrator.lock import locked_write
 def setup_inbox(root: Path, content_str: str = None):
     inbox = root / "Python_Inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    for f in inbox.glob("*"): f.unlink()
+    for f in inbox.glob("*"):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError:
+            pass
     bundle_path = inbox / "layer12_bundle.txt"
     content = content_str or '{"layer": 12, "schema_version": "2.1", "payload": {"data": "test"}}'
     with locked_write(bundle_path, content):
@@ -32,10 +36,10 @@ def run_before_tests():
         ctx = PipelineContext(run_id=run_id, manifest_path=manifest_path)
         Pipeline().run(ctx)
         
-    t1 = threading.Thread(target=run_pipeline, args=("conc_before_1",))
-    t2 = threading.Thread(target=run_pipeline, args=("conc_before_2",))
+    t1 = threading.Thread(target=run_pipeline, args=("conc_before_1",), daemon=True)
+    t2 = threading.Thread(target=run_pipeline, args=("conc_before_2",), daemon=True)
     t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.join(timeout=10.0); t2.join(timeout=10.0)
     
     # Bug 2: Crash Recovery Bypass
     print("\n--- BUG 2 (BEFORE): Crash Recovery Silent Bypass ---")

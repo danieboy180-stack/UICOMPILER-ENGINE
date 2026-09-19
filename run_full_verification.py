@@ -35,6 +35,17 @@ if hasattr(sys.stdout, 'reconfigure'):
 ROOT = Path(__file__).parent.resolve()
 
 
+def run_pytest() -> bool:
+    """Run pytest suite across the codebase (python -m pytest -q). Returns True if exited 0."""
+    print("=" * 70)
+    print("STEP 0: Running pytest suite (python -m pytest -q)...")
+    print("=" * 70)
+    cmd = [sys.executable, "-m", "pytest", "-q"]
+    result = subprocess.run(cmd, cwd=str(ROOT))
+    print()
+    return result.returncode == 0
+
+
 def run_tests(session_id: str) -> bool:
     """Run the full O14 spam suite. Returns True if the subprocess exited 0."""
     print("=" * 70)
@@ -74,7 +85,7 @@ def read_ledger() -> list:
     return entries
 
 
-def build_report(entries: list, session_id: str) -> str:
+def build_report(entries: list, session_id: str, pytest_ok: bool = True) -> str:
     """
     Derive a plain-language report ENTIRELY from ledger entries.
     No hardcoded pass counts. No cached results. Every number comes from the ledger.
@@ -142,8 +153,17 @@ def build_report(entries: list, session_id: str) -> str:
     durability_grade = 10 if silent_drop_count == 0 else 4
     security_grade = 10 if winerr_count == 0 else 8  # WinError on lock ≠ security failure per se
 
+    if not pytest_ok:
+        prod_grade = min(prod_grade, 5)
+        scale_grade = min(scale_grade, 5)
+        maint_grade = min(maint_grade, 5)
+        durability_grade = min(durability_grade, 5)
+        security_grade = min(security_grade, 5)
+
     # Build report string
     lines = []
+    if not pytest_ok:
+        lines.append("FAILED")
     lines.append(f"# VERIFICATION REPORT")
     lines.append(f"")
     lines.append(f"Generated: {now_ts}")
@@ -224,6 +244,12 @@ def main():
 
     session_id = uuid.uuid4().hex
     print(f"Verification session: {session_id}")
+
+    pytest_ok = run_pytest()
+    if not pytest_ok:
+        print("ERROR: Pytest suite failed.")
+        print()
+
     suite_ok = run_tests(session_id)
     if not suite_ok:
         print("WARNING: Test suite exited non-zero. Report will still be generated from this session ledger.")
@@ -237,7 +263,7 @@ def main():
     print()
 
     # The report's primary signal is limited to receipts tagged by this invocation.
-    report_text = build_report(entries, session_id)
+    report_text = build_report(entries, session_id, pytest_ok=pytest_ok)
 
     # Step 4: Write to file
     ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -259,6 +285,10 @@ def main():
     print(f"Report written to: {report_path}")
     print("=" * 70)
 
+    if not pytest_ok or not suite_ok:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
+

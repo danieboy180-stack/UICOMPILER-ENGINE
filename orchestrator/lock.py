@@ -9,21 +9,28 @@ from typing import Any, Optional
 
 _local = threading.local()
 
-def safe_unlink(path: Path | str, max_attempts: int = 5) -> None:
+def safe_unlink(path: Path | str, max_attempts: int = 30) -> None:
     path = Path(path)
+    backoff = 0.01
     for attempt in range(max_attempts):
         try:
             path.unlink(missing_ok=True)
             return
         except PermissionError:
+            if not path.exists():
+                return
             if attempt == max_attempts - 1:
                 raise
-            time.sleep(0.05)
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 0.1)
         except OSError:
+            if not path.exists():
+                return
             pass
 
-def safe_replace(src: Path | str, dst: Path | str, max_attempts: int = 10) -> None:
+def safe_replace(src: Path | str, dst: Path | str, max_attempts: int = 30) -> None:
     src, dst = Path(src), Path(dst)
+    backoff = 0.01
     for attempt in range(max_attempts):
         try:
             os.replace(src, dst)
@@ -31,7 +38,8 @@ def safe_replace(src: Path | str, dst: Path | str, max_attempts: int = 10) -> No
         except PermissionError:
             if attempt == max_attempts - 1:
                 raise
-            time.sleep(0.05)
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 0.1)
 
 @contextmanager
 def simple_file_lock(filepath: Path | str, timeout: float = 30.0):
@@ -86,7 +94,10 @@ def simple_file_lock(filepath: Path | str, timeout: float = 30.0):
         yield
     finally:
         _local.held_locks[canon_key] = 0
-        safe_unlink(lock_path)
+        try:
+            safe_unlink(lock_path)
+        except OSError:
+            pass
 
 @contextmanager
 def locked_read(path: Path | str, default: Any = None, parse_json: Optional[bool] = None, timeout: float = 30.0):
@@ -118,21 +129,27 @@ def locked_write(path: Path | str, content: Any, timeout: float = 30.0):
         uid = uuid.uuid4().hex
         tmp_path = path.with_suffix(f".{uid}.tmp")
 
-        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
-            if isinstance(content, (dict, list)):
-                json.dump(content, f, indent=2, sort_keys=True, ensure_ascii=True)
-            elif isinstance(content, str):
-                f.write(content)
-            else:
-                try:
+        try:
+            with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+                if isinstance(content, (dict, list)):
                     json.dump(content, f, indent=2, sort_keys=True, ensure_ascii=True)
-                except (TypeError, ValueError):
-                    f.write(str(content))
-            f.flush()
-            os.fsync(f.fileno())
+                elif isinstance(content, str):
+                    f.write(content)
+                else:
+                    try:
+                        json.dump(content, f, indent=2, sort_keys=True, ensure_ascii=True)
+                    except (TypeError, ValueError):
+                        f.write(str(content))
+                f.flush()
+                os.fsync(f.fileno())
 
-        safe_replace(tmp_path, path)
-        yield
+            safe_replace(tmp_path, path)
+            yield
+        finally:
+            try:
+                safe_unlink(tmp_path)
+            except OSError:
+                pass
 
 def locked_append(path: Path | str, text: str, timeout: float = 30.0) -> None:
     path = Path(path)

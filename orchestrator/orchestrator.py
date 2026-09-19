@@ -22,6 +22,12 @@ def mask_secrets(text: str) -> str:
     text = re.sub(r'(?i)(api[_-]?key\s*[:=]\s*)["\']?[a-zA-Z0-9\-\._~+/]+["\']?', r'\1"***"', text)
     return text
 
+def _canonical_json_hash(value: Any) -> str:
+    import hashlib
+    canon = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class PipelineContext:
     run_id: str
@@ -52,7 +58,7 @@ class RunLogger:
         
         # Write structured JSON lines (O9 Part B Gap 8)
         log_entry = {
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
             "step": step,
             "status": status,
             "message": mask_secrets(message)
@@ -328,13 +334,179 @@ class ConfidencePropagationStage(Stage):
             
         return True
 
+class Layer3Stage(Stage):
+    """
+    Stage O10/L3: Design System Reconstruction (Visual IR).
+    Fuses L2 semantics with L1 visual properties (colors, dimensions, text).
+    Writes layer3_visual_ir.json with full HASH_CHAIN block.
+    """
+    name = "Layer3"
+
+    def run(self, ctx: PipelineContext) -> bool:
+        root = ctx.manifest_path.parent.parent
+
+        # If already ingested and present in manifest, skip synthesis
+        if ctx.manifest_path.exists():
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path, default={}) as manifest:
+                if isinstance(manifest, dict) and manifest.get("artifacts", {}).get("layer3_visual_ir"):
+                    ctx.logger.log(self.name, "INFO", "Layer 3 artifact already ingested; skipping synthesis.")
+                    return True
+
+        # If gate failed during ingest, do not proceed or synthesize on missing data
+        if ctx.run_id:
+            failed_file = root / "Python_Output" / "runs" / ctx.run_id / "FAILED_layer3.json"
+            if failed_file.exists():
+                ctx.logger.log(self.name, "ERROR", f"Layer 3 validation gate failed during ingest for run {ctx.run_id}; cannot proceed.")
+                return False
+
+        ledger_path = root / "Artifacts" / "Artifact_Ledger.json"
+        if ledger_path.exists():
+            from .lock import locked_read
+            with locked_read(ledger_path, default=[]) as ledger:
+                if isinstance(ledger, list):
+                    for e in ledger:
+                        if e.get("run_id") == ctx.run_id and e.get("artifact") == "layer3_visual_ir" and e.get("status") == "failed_gate":
+                            ctx.logger.log(self.name, "ERROR", f"Layer 3 recorded as failed_gate in ledger for run {ctx.run_id}; cannot proceed.")
+                            return False
+
+        l1_data = ctx.storage.get("l1_data")
+        l2_data = ctx.storage.get("l2_data")
+
+        from .lock import locked_read
+        if l1_data is None:
+            l1_path = root / "Artifacts" / "layer1_ccir.json"
+            if l1_path.exists():
+                with locked_read(l1_path, default={}) as d:
+                    l1_data = d
+                    ctx.storage["l1_data"] = l1_data
+
+        if l2_data is None:
+            l2_path = root / "Artifacts" / "layer2_csir.json"
+            if l2_path.exists():
+                with locked_read(l2_path, default={}) as d:
+                    l2_data = d
+                    ctx.storage["l2_data"] = l2_data
+
+        from .bridge import bridge_l2_to_l3, SchemaBridgeError
+        try:
+            bridge_l2_to_l3(l2_data)
+        except SchemaBridgeError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+
+        candidates_by_id = {}
+        if isinstance(l1_data, dict):
+            for c in l1_data.get("candidates", []):
+                if isinstance(c, dict) and "id" in c:
+                    candidates_by_id[c["id"]] = c
+
+        semantics = l2_data.get("semantics", []) if isinstance(l2_data, dict) else []
+        visuals = []
+        for s in semantics:
+            if not isinstance(s, dict):
+                continue
+            s_id = s.get("id")
+            c = candidates_by_id.get(s_id, {})
+            
+            style = {
+                "background_color": c.get("dominant_color") or c.get("background_color") or c.get("color"),
+                "text_color": c.get("text_color"),
+                "font_size": c.get("font_size"),
+                "border_radius": c.get("border_radius"),
+                "border_color": c.get("border_color"),
+                "border_width": c.get("border_width"),
+            }
+            raw_text = c.get("ocr_text") or c.get("text") or s.get("text") or s.get("raw_text")
+            visuals.append({
+                "id": s_id,
+                "style": style,
+                "raw_text": raw_text
+            })
+
+        import hashlib
+        import json
+        canonical_l2 = json.dumps(l2_data, sort_keys=True, separators=(",", ":"))
+        input_hash = hashlib.sha256(canonical_l2.encode("utf-8")).hexdigest()
+
+        parent_hash = None
+        pipeline_id = "default_pipeline"
+        if ctx.manifest_path.exists():
+            with locked_read(ctx.manifest_path) as manifest:
+                parent_hash = manifest.get("artifacts", {}).get("layer2_csir", {}).get("hash") or manifest.get("layer2_hash")
+                pipeline_id = manifest.get("pipeline_id", "default_pipeline")
+
+        canonical_visuals = json.dumps(visuals, sort_keys=True, separators=(",", ":"))
+        output_hash = hashlib.sha256(canonical_visuals.encode("utf-8")).hexdigest()
+        pipeline_hash = hashlib.sha256(f"{pipeline_id}:{parent_hash}".encode("utf-8")).hexdigest()
+
+        l3_data = {
+            "schema_version": "2.1",
+            "hash_chain": {
+                "input_hash": input_hash,
+                "output_hash": output_hash,
+                "parent_hash": parent_hash,
+                "pipeline_hash": pipeline_hash
+            },
+            "visuals": visuals
+        }
+        ctx.storage["l3_data"] = l3_data
+
+        from .ledger import write_atomic_artifact
+        try:
+            write_atomic_artifact(root, "layer3_visual_ir", ctx.run_id, l3_data, parent_hash)
+            return True
+        except ValueError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+
+
 class ValidateL3Stage(Stage):
     name = "ValidateL3"
     
     def run(self, ctx: PipelineContext) -> bool:
-        l3_data = ctx.storage.get("l3_data")
-        if l3_data is None:
+        root = ctx.manifest_path.parent.parent
+        manifest_data = {}
+        if ctx.manifest_path.exists():
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path, default={}) as m:
+                manifest_data = m if isinstance(m, dict) else {}
+
+        l3_info = manifest_data.get("artifacts", {}).get("layer3_visual_ir")
+
+        # Only fall through to silent no-op if layer3_visual_ir genuinely doesn't exist in manifest AND storage
+        if l3_info is None and ctx.storage.get("l3_data") is None:
+            ctx.logger.log(self.name, "INFO", "Layer 3 artifact not ingested for this run; skipping as silent no-op.")
             return True
+
+        if l3_info is not None:
+            l3_file = root / "Artifacts" / "layer3_visual_ir.json"
+            if not l3_file.exists():
+                ctx.logger.log(self.name, "ERROR", f"Artifact layer3_visual_ir recorded in manifest but missing on disk: {l3_file}")
+                return False
+
+            from .lock import locked_read
+            with locked_read(l3_file, default=None) as data:
+                l3_data = data
+
+            if l3_data is None:
+                ctx.logger.log(self.name, "ERROR", f"Failed to read {l3_file}")
+                return False
+
+            disk_hash = _canonical_json_hash(l3_data)
+            manifest_hash = l3_info.get("hash")
+            if disk_hash != manifest_hash:
+                ctx.logger.log(self.name, "ERROR", f"Hash mismatch for layer3_visual_ir: disk={disk_hash} != manifest={manifest_hash}")
+                return False
+
+            ctx.storage["l3_data"] = l3_data
+            ctx.logger.log(self.name, "INFO", f"Loaded and verified layer3_visual_ir from disk (hash {disk_hash[:8]})")
+        else:
+            l3_data = ctx.storage.get("l3_data")
+
+        if l3_data is None:
+            ctx.logger.log(self.name, "ERROR", "Missing l3_data in pipeline context")
+            return False
             
         from .bridge import bridge_l3_to_l4_1, SchemaBridgeError
         try:
@@ -342,16 +514,217 @@ class ValidateL3Stage(Stage):
         except SchemaBridgeError as e:
             ctx.logger.log(self.name, "ERROR", str(e))
             return False
-            
+
+        if not isinstance(l3_data, dict) or l3_data.get("schema_version") != "2.1":
+            ctx.logger.log(self.name, "ERROR", "Invalid or missing schema_version in l3_data")
+            return False
+
+        hash_chain = l3_data.get("hash_chain")
+        if isinstance(hash_chain, dict):
+            for k in ("input_hash", "output_hash", "parent_hash", "pipeline_hash"):
+                if k not in hash_chain:
+                    ctx.logger.log(self.name, "ERROR", f"Missing key '{k}' in l3_data hash_chain")
+                    return False
+
+        visuals = l3_data.get("visuals")
+        if visuals is not None:
+            if not isinstance(visuals, list):
+                ctx.logger.log(self.name, "ERROR", "visuals must be a list in l3_data")
+                return False
+
+            for v in visuals:
+                if not isinstance(v, dict) or not v.get("id") or "style" not in v:
+                    ctx.logger.log(self.name, "ERROR", f"Malformed visual node in l3_data: {v}")
+                    return False
+
+        ctx.logger.log(self.name, "INFO", "ValidateL3Stage validation succeeded")
         return True
+
+
+class Layer4_1Stage(Stage):
+    """
+    Stage O10/L4.1: Canonical Semantic Engine (Semantic IR).
+    Constructs hierarchical layout tree (flex_row, flex_col, absolute) from visual and semantic IR.
+    Writes layer4_1_semantic_ir.json with full HASH_CHAIN block.
+    """
+    name = "Layer4.1"
+
+    def run(self, ctx: PipelineContext) -> bool:
+        root = ctx.manifest_path.parent.parent
+
+        # If already ingested and present in manifest, skip synthesis
+        if ctx.manifest_path.exists():
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path, default={}) as manifest:
+                if isinstance(manifest, dict) and manifest.get("artifacts", {}).get("layer4_1_semantic_ir"):
+                    ctx.logger.log(self.name, "INFO", "Layer 4.1 artifact already ingested; skipping synthesis.")
+                    return True
+
+        # If gate failed during ingest, do not proceed or synthesize on missing data
+        if ctx.run_id:
+            failed_file = root / "Python_Output" / "runs" / ctx.run_id / "FAILED_layer4_1.json"
+            if failed_file.exists():
+                ctx.logger.log(self.name, "ERROR", f"Layer 4.1 validation gate failed during ingest for run {ctx.run_id}; cannot proceed.")
+                return False
+
+        ledger_path = root / "Artifacts" / "Artifact_Ledger.json"
+        if ledger_path.exists():
+            from .lock import locked_read
+            with locked_read(ledger_path, default=[]) as ledger:
+                if isinstance(ledger, list):
+                    for e in ledger:
+                        if e.get("run_id") == ctx.run_id and e.get("artifact") == "layer4_1_semantic_ir" and e.get("status") == "failed_gate":
+                            ctx.logger.log(self.name, "ERROR", f"Layer 4.1 recorded as failed_gate in ledger for run {ctx.run_id}; cannot proceed.")
+                            return False
+
+        l3_data = ctx.storage.get("l3_data")
+        from .lock import locked_read
+        if l3_data is None:
+            l3_path = root / "Artifacts" / "layer3_visual_ir.json"
+            if l3_path.exists():
+                with locked_read(l3_path, default={}) as d:
+                    l3_data = d
+                    ctx.storage["l3_data"] = l3_data
+
+        from .bridge import bridge_l3_to_l4_1, SchemaBridgeError
+        try:
+            bridge_l3_to_l4_1(l3_data)
+        except SchemaBridgeError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+
+        visuals = l3_data.get("visuals", [])
+        children = []
+        for v in visuals:
+            v_id = v.get("id")
+            children.append({
+                "id": v_id,
+                "layout": {
+                    "layout_type": "flex_col",
+                    "justify_content": None,
+                    "align_items": None,
+                    "gap": 0,
+                    "margin": {"top": 0, "right": 0, "bottom": 0, "left": 0},
+                    "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0}
+                },
+                "children": []
+            })
+
+        root_tree = {
+            "id": "root_container",
+            "layout": {
+                "layout_type": "flex_col",
+                "justify_content": "flex-start",
+                "align_items": "stretch",
+                "gap": 8,
+                "margin": {"top": 0, "right": 0, "bottom": 0, "left": 0},
+                "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0}
+            },
+            "children": children
+        }
+
+        import hashlib
+        import json
+        canonical_l3 = json.dumps(l3_data, sort_keys=True, separators=(",", ":"))
+        input_hash = hashlib.sha256(canonical_l3.encode("utf-8")).hexdigest()
+
+        parent_hash = None
+        pipeline_id = "default_pipeline"
+        if ctx.manifest_path.exists():
+            with locked_read(ctx.manifest_path) as manifest:
+                parent_hash = manifest.get("artifacts", {}).get("layer3_visual_ir", {}).get("hash")
+                pipeline_id = manifest.get("pipeline_id", "default_pipeline")
+
+        canonical_root = json.dumps(root_tree, sort_keys=True, separators=(",", ":"))
+        output_hash = hashlib.sha256(canonical_root.encode("utf-8")).hexdigest()
+        pipeline_hash = hashlib.sha256(f"{pipeline_id}:{parent_hash}".encode("utf-8")).hexdigest()
+
+        l4_1_data = {
+            "schema_version": "2.1",
+            "hash_chain": {
+                "input_hash": input_hash,
+                "output_hash": output_hash,
+                "parent_hash": parent_hash,
+                "pipeline_hash": pipeline_hash
+            },
+            "root": root_tree
+        }
+        ctx.storage["l4_1_data"] = l4_1_data
+
+        from .ledger import write_atomic_artifact
+        try:
+            write_atomic_artifact(root, "layer4_1_semantic_ir", ctx.run_id, l4_1_data, parent_hash)
+            return True
+        except ValueError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+
 
 class ValidateL4_1Stage(Stage):
     name = "ValidateL4.1"
     
+    def _validate_node(self, node: Any, path: str = "root") -> str:
+        if not isinstance(node, dict):
+            return f"{path} is not an object"
+        if not node.get("id"):
+            return f"{path} missing 'id'"
+        layout = node.get("layout")
+        if not isinstance(layout, dict):
+            return f"{path} missing 'layout'"
+        if layout.get("layout_type") not in ("flex_row", "flex_col", "absolute"):
+            return f"{path}.layout has invalid layout_type: {layout.get('layout_type')}"
+        children = node.get("children")
+        if not isinstance(children, list):
+            return f"{path} 'children' is not a list"
+        for i, child in enumerate(children):
+            err = self._validate_node(child, f"{path}.children[{i}]")
+            if err:
+                return err
+        return ""
+
     def run(self, ctx: PipelineContext) -> bool:
-        l4_1_data = ctx.storage.get("l4_1_data")
-        if l4_1_data is None:
+        root = ctx.manifest_path.parent.parent
+        manifest_data = {}
+        if ctx.manifest_path.exists():
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path, default={}) as m:
+                manifest_data = m if isinstance(m, dict) else {}
+
+        l4_1_info = manifest_data.get("artifacts", {}).get("layer4_1_semantic_ir")
+
+        # Only fall through to silent no-op if layer4_1_semantic_ir genuinely doesn't exist in manifest AND storage
+        if l4_1_info is None and ctx.storage.get("l4_1_data") is None:
+            ctx.logger.log(self.name, "INFO", "Layer 4.1 artifact not ingested for this run; skipping as silent no-op.")
             return True
+
+        if l4_1_info is not None:
+            l4_1_file = root / "Artifacts" / "layer4_1_semantic_ir.json"
+            if not l4_1_file.exists():
+                ctx.logger.log(self.name, "ERROR", f"Artifact layer4_1_semantic_ir recorded in manifest but missing on disk: {l4_1_file}")
+                return False
+
+            from .lock import locked_read
+            with locked_read(l4_1_file, default=None) as data:
+                l4_1_data = data
+
+            if l4_1_data is None:
+                ctx.logger.log(self.name, "ERROR", f"Failed to read {l4_1_file}")
+                return False
+
+            disk_hash = _canonical_json_hash(l4_1_data)
+            manifest_hash = l4_1_info.get("hash")
+            if disk_hash != manifest_hash:
+                ctx.logger.log(self.name, "ERROR", f"Hash mismatch for layer4_1_semantic_ir: disk={disk_hash} != manifest={manifest_hash}")
+                return False
+
+            ctx.storage["l4_1_data"] = l4_1_data
+            ctx.logger.log(self.name, "INFO", f"Loaded and verified layer4_1_semantic_ir from disk (hash {disk_hash[:8]})")
+        else:
+            l4_1_data = ctx.storage.get("l4_1_data")
+
+        if l4_1_data is None:
+            ctx.logger.log(self.name, "ERROR", "Missing l4_1_data in pipeline context")
+            return False
             
         from .bridge import bridge_l4_1_to_l4_2, SchemaBridgeError
         try:
@@ -359,15 +732,253 @@ class ValidateL4_1Stage(Stage):
         except SchemaBridgeError as e:
             ctx.logger.log(self.name, "ERROR", str(e))
             return False
-            
+
+        if not isinstance(l4_1_data, dict) or l4_1_data.get("schema_version") != "2.1":
+            ctx.logger.log(self.name, "ERROR", "Invalid or missing schema_version in l4_1_data")
+            return False
+
+        hash_chain = l4_1_data.get("hash_chain")
+        if isinstance(hash_chain, dict):
+            for k in ("input_hash", "output_hash", "parent_hash", "pipeline_hash"):
+                if k not in hash_chain:
+                    ctx.logger.log(self.name, "ERROR", f"Missing key '{k}' in l4_1_data hash_chain")
+                    return False
+
+        root_node = l4_1_data.get("root")
+        if root_node is not None:
+            err = self._validate_node(root_node)
+            if err:
+                ctx.logger.log(self.name, "ERROR", f"Semantic tree validation failed: {err}")
+                return False
+
+        ctx.logger.log(self.name, "INFO", "ValidateL4_1Stage validation succeeded")
         return True
+
+
+class Layer4_2Stage(Stage):
+    """
+    Stage O10/L4.2: Canonical Execution Engine (Execution IR).
+    Combines semantic role (L2), visual styling & OCR text (L3), bounding box (L1),
+    and layout structure (L4.1) into the final ComponentNode execution tree.
+    Writes layer4_2_execution_ir.json with full HASH_CHAIN block.
+    """
+    name = "Layer4.2"
+
+    def run(self, ctx: PipelineContext) -> bool:
+        root = ctx.manifest_path.parent.parent
+
+        # If already ingested and present in manifest, skip synthesis
+        if ctx.manifest_path.exists():
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path, default={}) as manifest:
+                if isinstance(manifest, dict) and manifest.get("artifacts", {}).get("layer4_2_execution_ir"):
+                    ctx.logger.log(self.name, "INFO", "Layer 4.2 artifact already ingested; skipping synthesis.")
+                    return True
+
+        # If gate failed during ingest, do not proceed or synthesize on missing data
+        if ctx.run_id:
+            failed_file = root / "Python_Output" / "runs" / ctx.run_id / "FAILED_layer4_2.json"
+            if failed_file.exists():
+                ctx.logger.log(self.name, "ERROR", f"Layer 4.2 validation gate failed during ingest for run {ctx.run_id}; cannot proceed.")
+                return False
+
+        ledger_path = root / "Artifacts" / "Artifact_Ledger.json"
+        if ledger_path.exists():
+            from .lock import locked_read
+            with locked_read(ledger_path, default=[]) as ledger:
+                if isinstance(ledger, list):
+                    for e in ledger:
+                        if e.get("run_id") == ctx.run_id and e.get("artifact") == "layer4_2_execution_ir" and e.get("status") == "failed_gate":
+                            ctx.logger.log(self.name, "ERROR", f"Layer 4.2 recorded as failed_gate in ledger for run {ctx.run_id}; cannot proceed.")
+                            return False
+
+        l1_data = ctx.storage.get("l1_data", {})
+        l2_data = ctx.storage.get("l2_data", {})
+        l3_data = ctx.storage.get("l3_data", {})
+        l4_1_data = ctx.storage.get("l4_1_data", {})
+
+        from .lock import locked_read
+        if not l4_1_data:
+            p = root / "Artifacts" / "layer4_1_semantic_ir.json"
+            if p.exists():
+                with locked_read(p, default={}) as d:
+                    l4_1_data = d
+                    ctx.storage["l4_1_data"] = l4_1_data
+
+        from .bridge import bridge_l4_1_to_l4_2, SchemaBridgeError
+        try:
+            bridge_l4_1_to_l4_2(l4_1_data)
+        except SchemaBridgeError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+
+        l1_map = {c["id"]: c for c in l1_data.get("candidates", []) if isinstance(c, dict) and "id" in c} if isinstance(l1_data, dict) else {}
+        l2_map = {s["id"]: s for s in l2_data.get("semantics", []) if isinstance(s, dict) and "id" in s} if isinstance(l2_data, dict) else {}
+        l3_map = {v["id"]: v for v in l3_data.get("visuals", []) if isinstance(v, dict) and "id" in v} if isinstance(l3_data, dict) else {}
+
+        def build_component_tree(semantic_node: dict) -> dict:
+            n_id = semantic_node.get("id", "unknown")
+            l2_info = l2_map.get(n_id, {})
+            l1_info = l1_map.get(n_id, {})
+            l3_info = l3_map.get(n_id, {})
+
+            c_type = l2_info.get("semantic_role", "container")
+            c_variant = l2_info.get("semantic_variant")
+            bbox = l1_info.get("bbox", {"x": 0, "y": 0, "w": 0, "h": 0})
+            style = l3_info.get("style", {})
+            content = l3_info.get("raw_text")
+            layout = semantic_node.get("layout", {"layout_type": "flex_col"})
+            
+            children = []
+            for child in semantic_node.get("children", []):
+                children.append(build_component_tree(child))
+
+            return {
+                "id": n_id,
+                "type": c_type,
+                "variant": c_variant,
+                "bbox": bbox,
+                "style": style,
+                "content": content,
+                "layout": layout,
+                "children": children
+            }
+
+        root_node = build_component_tree(l4_1_data.get("root", {}))
+
+        import hashlib
+        import json
+        canonical_l4_1 = json.dumps(l4_1_data, sort_keys=True, separators=(",", ":"))
+        input_hash = hashlib.sha256(canonical_l4_1.encode("utf-8")).hexdigest()
+
+        parent_hash = None
+        pipeline_id = "default_pipeline"
+        if ctx.manifest_path.exists():
+            with locked_read(ctx.manifest_path) as manifest:
+                parent_hash = manifest.get("artifacts", {}).get("layer4_1_semantic_ir", {}).get("hash")
+                pipeline_id = manifest.get("pipeline_id", "default_pipeline")
+
+        canonical_root = json.dumps(root_node, sort_keys=True, separators=(",", ":"))
+        output_hash = hashlib.sha256(canonical_root.encode("utf-8")).hexdigest()
+        pipeline_hash = hashlib.sha256(f"{pipeline_id}:{parent_hash}".encode("utf-8")).hexdigest()
+
+        l4_2_data = {
+            "schema_version": "2.1",
+            "hash_chain": {
+                "input_hash": input_hash,
+                "output_hash": output_hash,
+                "parent_hash": parent_hash,
+                "pipeline_hash": pipeline_hash
+            },
+            "root_node": root_node
+        }
+        ctx.storage["l4_2_data"] = l4_2_data
+
+        from .ledger import write_atomic_artifact
+        try:
+            write_atomic_artifact(root, "layer4_2_execution_ir", ctx.run_id, l4_2_data, parent_hash)
+            return True
+        except ValueError as e:
+            ctx.logger.log(self.name, "ERROR", str(e))
+            return False
+
 
 class ValidateL4_2Stage(Stage):
     name = "ValidateL4.2"
+    CANONICAL_TAXONOMY = {"button", "input", "text", "image", "container"}
+
+    def _collect_all_nodes(self, node: Any, nodes_list: list):
+        if isinstance(node, dict):
+            nodes_list.append(node)
+            for child in node.get("children", []):
+                self._collect_all_nodes(child, nodes_list)
+
     def run(self, ctx: PipelineContext) -> bool:
-        # For testing, we look at storage flag to force failure
         if ctx.storage.get("force_layer4_2_fail"):
             return False
+
+        root = ctx.manifest_path.parent.parent
+        manifest_data = {}
+        if ctx.manifest_path.exists():
+            from .lock import locked_read
+            with locked_read(ctx.manifest_path, default={}) as m:
+                manifest_data = m if isinstance(m, dict) else {}
+
+        l4_2_info = manifest_data.get("artifacts", {}).get("layer4_2_execution_ir")
+
+        # Only fall through to silent no-op if layer4_2_execution_ir genuinely doesn't exist in manifest AND storage
+        if l4_2_info is None and ctx.storage.get("l4_2_data") is None:
+            ctx.logger.log(self.name, "INFO", "Layer 4.2 artifact not ingested for this run; skipping as silent no-op.")
+            return True
+
+        if l4_2_info is not None:
+            l4_2_file = root / "Artifacts" / "layer4_2_execution_ir.json"
+            if not l4_2_file.exists():
+                ctx.logger.log(self.name, "ERROR", f"Artifact layer4_2_execution_ir recorded in manifest but missing on disk: {l4_2_file}")
+                return False
+
+            from .lock import locked_read
+            with locked_read(l4_2_file, default=None) as data:
+                l4_2_data = data
+
+            if l4_2_data is None:
+                ctx.logger.log(self.name, "ERROR", f"Failed to read {l4_2_file}")
+                return False
+
+            disk_hash = _canonical_json_hash(l4_2_data)
+            manifest_hash = l4_2_info.get("hash")
+            if disk_hash != manifest_hash:
+                ctx.logger.log(self.name, "ERROR", f"Hash mismatch for layer4_2_execution_ir: disk={disk_hash} != manifest={manifest_hash}")
+                return False
+
+            ctx.storage["l4_2_data"] = l4_2_data
+            ctx.logger.log(self.name, "INFO", f"Loaded and verified layer4_2_execution_ir from disk (hash {disk_hash[:8]})")
+        else:
+            l4_2_data = ctx.storage.get("l4_2_data")
+
+        if l4_2_data is None:
+            ctx.logger.log(self.name, "ERROR", "Missing l4_2_data in pipeline context")
+            return False
+
+        if not isinstance(l4_2_data, dict) or l4_2_data.get("schema_version") != "2.1":
+            ctx.logger.log(self.name, "ERROR", "Invalid or missing schema_version in l4_2_data")
+            return False
+
+        # Verify l4_2_data["validation"]["status"] == "pass" per Layer 4.2 Output shape
+        val_block = l4_2_data.get("validation")
+        if isinstance(val_block, dict):
+            if val_block.get("status") != "pass":
+                ctx.logger.log(self.name, "ERROR", f"Layer 4.2 validation status is not pass: {val_block.get('status')}")
+                return False
+        elif "validation" in l4_2_data:
+            ctx.logger.log(self.name, "ERROR", "Layer 4.2 validation field is not an object")
+            return False
+
+        hash_chain = l4_2_data.get("hash_chain")
+        if isinstance(hash_chain, dict):
+            for k in ("input_hash", "output_hash", "parent_hash", "pipeline_hash"):
+                if k not in hash_chain:
+                    ctx.logger.log(self.name, "ERROR", f"Missing key '{k}' in l4_2_data hash_chain")
+                    return False
+
+        root_node = l4_2_data.get("root_node")
+        if isinstance(root_node, dict):
+            all_nodes = []
+            self._collect_all_nodes(root_node, all_nodes)
+            known_ids = {n.get("id") for n in all_nodes if n.get("id")}
+
+            for n in all_nodes:
+                n_type = n.get("type")
+                if n_type not in self.CANONICAL_TAXONOMY:
+                    ctx.logger.log(self.name, "ERROR", f"Taxonomy violation: node '{n.get('id')}' has invalid type '{n_type}'. Expected one of {self.CANONICAL_TAXONOMY}")
+                    return False
+
+                target = n.get("interaction_target") or n.get("target_id") or n.get("action_target")
+                if target is not None and target not in known_ids:
+                    ctx.logger.log(self.name, "ERROR", f"Dangling interaction target: node '{n.get('id')}' references nonexistent target '{target}'")
+                    return False
+
+        ctx.logger.log(self.name, "INFO", "ValidateL4_2Stage validation succeeded")
         return True
     
     def failure_code(self, ctx: PipelineContext) -> int:
@@ -384,8 +995,7 @@ class Layer4_3Stage(Stage):
         if ctx.manifest_path.exists():
             from .lock import locked_read
             with locked_read(ctx.manifest_path) as manifest:
-                pass
-                parent_hash = manifest.get("layer2_hash")
+                parent_hash = manifest.get("artifacts", {}).get("layer4_2_execution_ir", {}).get("hash") or manifest.get("layer2_hash")
 
         payload = {"layer": "4.3", "payload": "completed"}
         try:
@@ -539,11 +1149,64 @@ class MetaVerifyStage(Stage):
         return ctx.storage.get("meta_verify_code", EXIT_10)
 
 class SaveStage(Stage):
+    """
+    SaveStage: Final pipeline export stage.
+    Defines the export responsibility: persists all verified output artifacts from
+    Artifacts/*.json and the run manifest to the designated output export directory:
+    Python_Output/runs/<run_id>/exported/ along with an export_manifest.json before archival.
+    """
     name = "Save"
     def run(self, ctx: PipelineContext) -> bool:
         if ctx.storage.get("force_save_fail"):
             return False
-        return True
+
+        try:
+            root = ctx.manifest_path.parent.parent
+            export_dir = root / "Python_Output" / "runs" / ctx.run_id / "exported"
+            export_dir.mkdir(parents=True, exist_ok=True)
+
+            artifacts_dir = root / "Artifacts"
+            exported_files = {}
+
+            from .lock import locked_read, locked_write
+            if artifacts_dir.exists():
+                for source in artifacts_dir.glob("*.json"):
+                    if source.suffix in {".lock", ".tmp"}:
+                        continue
+                    with locked_read(source, parse_json=False) as content:
+                        if content is not None:
+                            dest = export_dir / source.name
+                            with locked_write(dest, content):
+                                pass
+                            import hashlib
+                            raw_bytes = content.encode("utf-8") if isinstance(content, str) else content
+                            exported_files[source.name] = hashlib.sha256(raw_bytes).hexdigest()
+
+            # Copy manifest
+            if ctx.manifest_path.exists():
+                with locked_read(ctx.manifest_path, parse_json=False) as content:
+                    if content is not None:
+                        dest = export_dir / ctx.manifest_path.name
+                        with locked_write(dest, content):
+                            pass
+
+            import datetime
+            export_manifest = {
+                "run_id": ctx.run_id,
+                "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                "exported_artifacts": exported_files,
+                "status": "EXPORTED"
+            }
+            with locked_write(export_dir / "export_manifest.json", export_manifest):
+                pass
+
+            return True
+        except (TimeoutError, OSError) as exc:
+            ctx.logger.log(self.name, "ERROR", f"Shared-file access failed: {exc}")
+            return False
+        except Exception as exc:
+            ctx.logger.log(self.name, "ERROR", f"Save export failed: {exc}")
+            return False
     
     def failure_code(self, ctx: PipelineContext) -> int:
         return 50
@@ -665,27 +1328,54 @@ class Pipeline:
     def __init__(self):
         # Local import to avoid circular dependency
         from .checkpoint import CheckpointStage
+        self.ingest_stage = IngestStage()
+        self.freeze_boundary_stage = FreezeBoundaryStage()
+        self.validate_l1_stage = ValidateL1Stage()
+        self.validate_l2_stage = ValidateL2Stage()
+        self.confidence_propagation_stage = ConfidencePropagationStage()
+        self.layer3_stage = Layer3Stage()
+        self.validate_l3_stage = ValidateL3Stage()
+        self.layer4_1_stage = Layer4_1Stage()
+        self.validate_l4_1_stage = ValidateL4_1Stage()
+        self.layer4_2_stage = Layer4_2Stage()
+        self.validate_l4_2_stage = ValidateL4_2Stage()
+        self.checkpoint_l4_3 = CheckpointStage("Layer4_3")
+        self.layer4_3_stage = Layer4_3Stage()
+        self.checkpoint_l5 = CheckpointStage("Layer5")
+        self.layer5_stage = Layer5Stage()
+        self.checkpoint_l6 = CheckpointStage("Layer6")
+        self.layer6_stage = Layer6Stage()
+        self.meta_verify_stage = MetaVerifyStage()
+        self.save_stage = SaveStage()
+        self.archive_stage = ArchiveStage()
+        self.pipeline_ledger_stage = PipelineLedgerStage()
+        self.build_report_stage = BuildReportStage()
+
         self.stages: List[Stage] = [
-            IngestStage(),
-            FreezeBoundaryStage(),
-            ValidateL1Stage(),
-            ValidateL2Stage(),
-            ConfidencePropagationStage(),
-            ValidateL3Stage(),
-            ValidateL4_1Stage(),
-            ValidateL4_2Stage(),
-            CheckpointStage("Layer4_3"),
-            Layer4_3Stage(),
-            CheckpointStage("Layer5"),
-            Layer5Stage(),
-            CheckpointStage("Layer6"),
-            Layer6Stage(),
-            MetaVerifyStage(),
-            SaveStage(),
-            ArchiveStage(),
-            PipelineLedgerStage(),
-            BuildReportStage()
+            self.ingest_stage,
+            self.freeze_boundary_stage,
+            self.validate_l1_stage,
+            self.validate_l2_stage,
+            self.confidence_propagation_stage,
+            self.layer3_stage,
+            self.validate_l3_stage,
+            self.layer4_1_stage,
+            self.validate_l4_1_stage,
+            self.layer4_2_stage,
+            self.validate_l4_2_stage,
+            self.checkpoint_l4_3,
+            self.layer4_3_stage,
+            self.checkpoint_l5,
+            self.layer5_stage,
+            self.checkpoint_l6,
+            self.layer6_stage,
+            self.meta_verify_stage,
+            self.save_stage,
+            self.archive_stage,
+            self.pipeline_ledger_stage,
+            self.build_report_stage
         ]
+        self._stage_by_class = {type(s).__name__: s for s in self.stages}
 
     def run(self, ctx: PipelineContext) -> int:
         from .checkpoint import RollbackStage
@@ -733,7 +1423,17 @@ class Pipeline:
                 
                 ctx.storage["hash_chain_valid"] = hash_valid
                 
-                if 1 <= idx <= 12:
+                non_rollback_stages = {
+                    self.ingest_stage.name,
+                    self.meta_verify_stage.name,
+                    self.save_stage.name,
+                    self.archive_stage.name,
+                    self.pipeline_ledger_stage.name,
+                    self.build_report_stage.name
+                }
+                should_rollback = stage.name not in non_rollback_stages
+
+                if should_rollback:
                     ctx.logger.log("Rollback", "INVOKING")
                     rollback_success = RollbackStage().run(ctx)
                     if not rollback_success:
@@ -742,17 +1442,17 @@ class Pipeline:
                         ctx.logger.log("Rollback", "PASSED")
                         
                 if "pipeline_status" not in ctx.storage:
-                    ctx.storage["pipeline_status"] = "ROLLED_BACK" if 1 <= idx <= 12 else "FAIL"
+                    ctx.storage["pipeline_status"] = "ROLLED_BACK" if should_rollback else "FAIL"
                 
-                # Write to pipeline ledger (Step 16 / Index 15)
+                # Write the pipeline ledger through its stage reference
                 try:
-                    self.stages[15].run(ctx)
+                    self._stage_by_class["PipelineLedgerStage"].run(ctx)
                 except Exception as exc:
                     ctx.logger.log("PipelineLedger", "ERROR", f"Shared-file access failed: {exc}")
                 
-                # Generate build report (Step 17 / Index 16)
+                # Generate the build report through its stage reference
                 try:
-                    self.stages[16].run(ctx)
+                    self._stage_by_class["BuildReportStage"].run(ctx)
                 except Exception as exc:
                     ctx.logger.log("BuildReport", "ERROR", f"Shared-file access failed: {exc}")
                 

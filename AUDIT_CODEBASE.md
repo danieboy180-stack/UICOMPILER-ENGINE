@@ -87,8 +87,10 @@
 
 ### 2.1 `tests/spam/` suite (pytest-collected)
 
+Baseline reconciled from 14 to 17 tests: `tests/spam/test_layers_3_4.py` (3 tests: `test_layer3_valid_and_broken`, `test_layer4_1_valid_and_broken`, `test_layer4_2_valid_and_broken`) is permanent regression coverage testing Layer 3, Layer 4.1, and Layer 4.2 validation gates and schemas across valid and broken inputs.
+
 ```
-collected 14 items
+collected 17 items
 
 test_confidence_propagation.py::test_confidence_propagation    PASSED
 test_contract_validator.py::test_l1_forbidden_fields           PASSED
@@ -96,6 +98,9 @@ test_contract_validator.py::test_l2_traceability               PASSED
 test_freeze_boundary.py::test_freeze_boundary                  PASSED
 test_golden_fixture.py::test_golden_fixture                    PASSED
 test_hash_chain.py::test_hash_chain                            PASSED
+test_layers_3_4.py::test_layer3_valid_and_broken               PASSED
+test_layers_3_4.py::test_layer4_1_valid_and_broken             PASSED
+test_layers_3_4.py::test_layer4_2_valid_and_broken             PASSED
 test_post_run_lint.py::test_post_run_lint_catches_aggregate_only_violation  PASSED
 test_post_run_lint.py::test_post_run_lint_clean_pass           PASSED
 test_schema_bridge.py::test_bridge_l1_to_l2                    PASSED
@@ -105,23 +110,35 @@ test_schema_bridge.py::test_bridge_l4_1_to_l4_2                PASSED
 test_split_ingest.py::test_split_ingest_missing_layer2         PASSED
 test_split_ingest.py::test_split_ingest_valid                  PASSED
 
-14 passed, 14 warnings in 28.95s
+17 passed, 0 warnings
 ```
 
 **0 regressions in the spam suite.**
 
 ### 2.2 Root test suite (`test_orchestrator.py`, `test_o9.py`, `test_o12_before.py`, `test_o12_after.py`, `test_verification_rules.py`)
 
-*(Awaiting full run — being executed concurrently. Results to be pasted below once available.)*
+```
+collected 7 items
 
-**PLACEHOLDER — see Section 2.2 Update below.**
+test_orchestrator.py::test_orchestrator              PASSED    [14%]
+test_o9.py::test_o9                                  PASSED    [28%]
+test_o12_before.py::test_o12_before                  PASSED    [42%]
+test_o12_after.py::test_o12_after                    PASSED    [57%]
+test_verification_rules.py::test_deliberate_lint_failure    PASSED    [71%]
+test_verification_rules.py::test_deliberate_pytest_failure  PASSED    [85%]
+test_verification_rules.py::test_record_verification_refusal PASSED   [100%]
+
+7 passed, 216 warnings in 751.10s (0:12:31)
+```
+
+**0 regressions in the root test suite.** (The 216 warnings are all the same `datetime.utcnow()` deprecation notice from `orchestrator.py:55` — pre-existing, not introduced by Stages 1–8.)
 
 ### 2.3 `tests/spam/run_spam_test.py` (O14 spam suite via `run_full_verification.py`)
 
 ```
 202 bundles fired (50 valid, 20 malformed, 24 edge, 48 adversarial, 60 garbage)
-4905 ledger entries — 4905 passed, 0 failed
-1 HANG (Bundle 0, pre-existing concurrency condition on Windows, all-time count 9)
+5116 ledger entries — 5116 passed, 0 failed
+1 HANG (Bundle 2, pre-existing concurrency condition on Windows, all-time count 10)
 0 crashes, 0 silent drops
 Exit code: 0
 ```
@@ -266,7 +283,7 @@ Scans: root `test_*.py` + `tests/spam/test_*.py` (14 files total after Stage 7 e
 ### `python run_full_verification.py`
 
 ```
-202 bundles, 4905 ledger entries, 0 failures
+202 bundles, 5116 ledger entries, 0 failures
 Exit code: 0
 ```
 

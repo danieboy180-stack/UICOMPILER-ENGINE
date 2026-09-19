@@ -8,4 +8,9 @@ Python_Output/
 Reports/
 __pycache__/
 *.pyc
+*.bak
+*.lock
+test_*.txt
+scratch*.py
+
 

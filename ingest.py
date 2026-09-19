@@ -18,7 +18,6 @@ from pydantic import BaseModel, ValidationError
 
 EXIT_OK = 0
 EXIT_10 = 10
-CANONICAL_NAME = "layer12_bundle"
 ALLOWED_FILES = {"layer12_bundle.txt"}
 
 class Layer1CCIR(BaseModel):
@@ -179,7 +178,10 @@ def ingest(root: Path) -> int:
     
     manifest_path = root / "Manifest" / f"manifest_{run_id}.json"
     manifest = _read_json(manifest_path, {"next_layer": None, "artifacts": {}})
-    parent_hash = manifest.get("artifacts", {}).get(CANONICAL_NAME, {}).get("hash")
+    # layer1_ccir is the first artifact in the chain for this run — no parent
+    # within this run. Cross-run provenance is not implemented; if needed later,
+    # resolve it explicitly here instead of an inert lookup.
+    parent_hash = None
     
     entry1 = {
         "artifact": "layer1_ccir",

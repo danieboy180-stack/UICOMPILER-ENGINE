@@ -11,7 +11,11 @@ import shutil
 def setup_inbox(root: Path, content_str: str = None):
     inbox = root / "Python_Inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    for f in inbox.glob("*"): f.unlink()
+    for f in inbox.glob("*"):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError:
+            pass
     bundle_path = inbox / "layer12_bundle.txt"
     content = content_str or '{"layer": 12, "schema_version": "2.1", "payload": {"data": "test"}}'
     with locked_write(bundle_path, content):
@@ -71,10 +75,10 @@ def run_after_tests():
         pipeline.stages = [s for s in pipeline.stages if s.name != "Ingest"]
         pipeline.run(ctx)
         
-    t1 = threading.Thread(target=run_conc_pipeline, args=("conc_after_1", "hash1"))
-    t2 = threading.Thread(target=run_conc_pipeline, args=("conc_after_2", "hash2"))
+    t1 = threading.Thread(target=run_conc_pipeline, args=("conc_after_1", "hash1"), daemon=True)
+    t2 = threading.Thread(target=run_conc_pipeline, args=("conc_after_2", "hash2"), daemon=True)
     t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.join(timeout=10.0); t2.join(timeout=10.0)
     
     # Bug 2: Crash Recovery Bypass
     print("\n--- BUG 2 (AFTER): Crash Recovery (No silent assertions) ---")
