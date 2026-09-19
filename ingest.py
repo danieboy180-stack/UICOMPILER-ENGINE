@@ -77,26 +77,31 @@ def _recover_transaction(root: Path, run_id: str) -> None:
 def _commit_outputs(root: Path, outputs: dict[Path, Any], run_id: str) -> None:
     transaction_path = root / f".ingest_transaction_{run_id}.json"
     backups: list[dict[str, Any]] = []
-    from orchestrator.lock import locked_write, safe_unlink
+    from orchestrator.lock import locked_read, locked_write, safe_unlink
     try:
-        for target, value in outputs.items():
+        # Step 1: Create backups for all targets before any modifications
+        for target in outputs.keys():
             target.parent.mkdir(parents=True, exist_ok=True)
             backup = target.with_name(f".{target.name}.{uuid.uuid4().hex}.bak")
             existed = target.exists()
             if existed:
-                from orchestrator.lock import locked_read, locked_write
                 with locked_read(target, parse_json=False) as existing_content:
-                    pass
-                with locked_write(backup, existing_content):
-                    pass
+                    if existing_content is not None:
+                        with locked_write(backup, existing_content):
+                            pass
             backups.append({
                 "target": str(target.relative_to(root)),
                 "backup": str(backup.relative_to(root)),
                 "existed": existed,
             })
+
+        # Step 2: Write transaction journal BEFORE modifying targets (True WAL)
+        _atomic_json_write(transaction_path, {"backups": backups})
+
+        # Step 3: Atomically write new target values
+        for target, value in outputs.items():
             with locked_write(target, value):
                 pass
-        _atomic_json_write(transaction_path, {"backups": backups})
     except Exception:
         _recover_transaction(root, run_id)
         raise

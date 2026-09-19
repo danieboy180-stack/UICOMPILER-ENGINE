@@ -73,6 +73,7 @@ def main():
     # Stage 7: also scan tests/spam/ so test_post_run_lint.py and all
     # other spam-suite test files are covered by the lint gate.
     test_files = list(root.glob("test_*.py"))
+    test_files += list((root / "tests").glob("test_*.py"))
     test_files += list((root / "tests" / "spam").glob("test_*.py"))
 
     # De-duplicate (in case cwd is already inside tests/spam)

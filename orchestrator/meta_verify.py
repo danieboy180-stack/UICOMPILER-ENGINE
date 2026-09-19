@@ -21,12 +21,12 @@ def verify_integrity(root: Path, run_id: str, logger: RunLogger) -> Tuple[bool, 
         return False, EXIT_30
         
     from .lock import locked_read
-    with locked_read(manifest_path) as manifest:
-        pass
-    with locked_read(ledger_path) as ledger:
-        pass
+    with locked_read(manifest_path, default={}) as manifest:
+        manifest_data = manifest if isinstance(manifest, dict) else {}
+    with locked_read(ledger_path, default=[]) as ledger:
+        ledger_data = ledger if isinstance(ledger, list) else []
         
-    run_entries = [e for e in ledger if e.get("run_id") == run_id and e.get("status") == "written"]
+    run_entries = [e for e in ledger_data if isinstance(e, dict) and e.get("run_id") == run_id and e.get("status") == "written"]
     
     if not run_entries:
         logger.log("MetaVerify", "INFO", "No artifacts written in this run.")
@@ -41,8 +41,7 @@ def verify_integrity(root: Path, run_id: str, logger: RunLogger) -> Tuple[bool, 
             logger.log("MetaVerify", "ERROR", f"Artifact missing on disk: {artifact_name}")
             return False, EXIT_30
             
-        with locked_read(file_path) as data:
-            pass
+        with locked_read(file_path, default={}) as data:
             data_str = json.dumps(data, sort_keys=True, separators=(",", ":"))
             h = hashlib.sha256(data_str.encode('utf-8')).hexdigest()
             computed_hashes[artifact_name] = h
@@ -51,7 +50,7 @@ def verify_integrity(root: Path, run_id: str, logger: RunLogger) -> Tuple[bool, 
             logger.log("MetaVerify", "ERROR", f"Hash mismatch for {artifact_name}. Tampering detected!")
             return False, EXIT_30
             
-        manifest_hash = manifest.get("artifacts", {}).get(artifact_name, {}).get("hash")
+        manifest_hash = manifest_data.get("artifacts", {}).get(artifact_name, {}).get("hash")
         if h != manifest_hash:
             logger.log("MetaVerify", "ERROR", f"Manifest hash mismatch for {artifact_name}. Tampering detected!")
             return False, EXIT_30

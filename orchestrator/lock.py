@@ -67,10 +67,11 @@ def simple_file_lock(filepath: Path | str, timeout: float = 30.0):
 
     while time.monotonic() - start < timeout:
         try:
-            # Check for stale lock (Gap 5: Crash recovery)
+            # Check for stale lock (stale threshold must always be strictly greater than wait timeout)
             if lock_path.exists():
                 try:
-                    if time.time() - lock_path.stat().st_mtime > 10.0:
+                    stale_threshold = max(timeout * 2.0, 60.0)
+                    if time.time() - lock_path.stat().st_mtime > stale_threshold:
                         try:
                             safe_unlink(lock_path)
                         except OSError:

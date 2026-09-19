@@ -54,14 +54,41 @@ class RollbackStage(Stage):
 
             if failed_stage:
                 failed_stage_lower = failed_stage.lower()
-                output_file = root / "Artifacts" / f"{failed_stage_lower}.json"
-                if output_file.exists():
-                    dest_dir = root / "Python_Output" / "runs" / ctx.run_id
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    dest_file = dest_dir / f"FAILED_{failed_stage_lower}.json"
-                    with simple_file_lock(output_file):
-                        safe_replace(output_file, dest_file)
-                    ctx.logger.log(self.name, "INFO", f"Moved failing output to {dest_file}")
+                # Map stage name to real artifact filenames
+                stage_artifact_map = {
+                    "layer1": "layer1_ccir.json",
+                    "validatel1": "layer1_ccir.json",
+                    "layer2": "layer2_csir.json",
+                    "validatel2": "layer2_csir.json",
+                    "layer3": "layer3_visual_ir.json",
+                    "validatel3": "layer3_visual_ir.json",
+                    "layer4_1": "layer4_1_semantic_ir.json",
+                    "layer4.1": "layer4_1_semantic_ir.json",
+                    "validatel4_1": "layer4_1_semantic_ir.json",
+                    "validatel4.1": "layer4_1_semantic_ir.json",
+                    "layer4_2": "layer4_2_execution_ir.json",
+                    "layer4.2": "layer4_2_execution_ir.json",
+                    "validatel4_2": "layer4_2_execution_ir.json",
+                    "validatel4.2": "layer4_2_execution_ir.json",
+                    "layer4_3": "layer4_3.json",
+                    "layer4.3": "layer4_3.json",
+                    "layer5": "layer5.json",
+                    "layer6": "layer6.json",
+                }
+                candidates = [root / "Artifacts" / f"{failed_stage_lower}.json"]
+                art_name = stage_artifact_map.get(failed_stage_lower)
+                if art_name:
+                    candidates.insert(0, root / "Artifacts" / art_name)
+
+                for output_file in candidates:
+                    if output_file.exists():
+                        dest_dir = root / "Python_Output" / "runs" / ctx.run_id
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        dest_file = dest_dir / f"FAILED_{output_file.stem}.json"
+                        with simple_file_lock(output_file):
+                            safe_replace(output_file, dest_file)
+                        ctx.logger.log(self.name, "INFO", f"Moved failing output to {dest_file}")
+                        break
 
             ctx.logger.log(self.name, "INFO", "Rollback complete. Pipeline halted.")
             return True

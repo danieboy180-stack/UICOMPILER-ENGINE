@@ -515,8 +515,10 @@ class ValidateL3Stage(Stage):
             ctx.logger.log(self.name, "ERROR", str(e))
             return False
 
-        if not isinstance(l3_data, dict) or l3_data.get("schema_version") != "2.1":
-            ctx.logger.log(self.name, "ERROR", "Invalid or missing schema_version in l3_data")
+        from .schema import extract_schema_version, is_valid_schema_version
+        schema_ver = extract_schema_version(manifest_data.get("artifacts", {}).get("layer3_visual_ir"), layer_body=l3_data)
+        if not is_valid_schema_version(schema_ver):
+            ctx.logger.log(self.name, "ERROR", f"Invalid or missing schema_version in l3_data: '{schema_ver}'")
             return False
 
         hash_chain = l3_data.get("hash_chain")
@@ -733,8 +735,10 @@ class ValidateL4_1Stage(Stage):
             ctx.logger.log(self.name, "ERROR", str(e))
             return False
 
-        if not isinstance(l4_1_data, dict) or l4_1_data.get("schema_version") != "2.1":
-            ctx.logger.log(self.name, "ERROR", "Invalid or missing schema_version in l4_1_data")
+        from .schema import extract_schema_version, is_valid_schema_version
+        schema_ver = extract_schema_version(manifest_data.get("artifacts", {}).get("layer4_1_semantic_ir"), layer_body=l4_1_data)
+        if not is_valid_schema_version(schema_ver):
+            ctx.logger.log(self.name, "ERROR", f"Invalid or missing schema_version in l4_1_data: '{schema_ver}'")
             return False
 
         hash_chain = l4_1_data.get("hash_chain")
@@ -940,17 +944,20 @@ class ValidateL4_2Stage(Stage):
             ctx.logger.log(self.name, "ERROR", "Missing l4_2_data in pipeline context")
             return False
 
-        if not isinstance(l4_2_data, dict) or l4_2_data.get("schema_version") != "2.1":
-            ctx.logger.log(self.name, "ERROR", "Invalid or missing schema_version in l4_2_data")
+        from .schema import extract_schema_version, is_valid_schema_version
+        schema_ver = extract_schema_version(manifest_data.get("artifacts", {}).get("layer4_2_execution_ir"), layer_body=l4_2_data)
+        if not is_valid_schema_version(schema_ver):
+            ctx.logger.log(self.name, "ERROR", f"Invalid or missing schema_version in l4_2_data: '{schema_ver}'")
             return False
 
-        # Verify l4_2_data["validation"]["status"] == "pass" per Layer 4.2 Output shape
-        val_block = l4_2_data.get("validation")
+        # Verify validation block status == "pass" (supports both lowercase 'validation' and uppercase 'VALIDATION')
+        val_block = l4_2_data.get("validation") or l4_2_data.get("VALIDATION")
         if isinstance(val_block, dict):
-            if val_block.get("status") != "pass":
-                ctx.logger.log(self.name, "ERROR", f"Layer 4.2 validation status is not pass: {val_block.get('status')}")
+            val_st = val_block.get("status") or val_block.get("gate_result")
+            if val_st and str(val_st).lower() != "pass":
+                ctx.logger.log(self.name, "ERROR", f"Layer 4.2 validation status is not pass: {val_st}")
                 return False
-        elif "validation" in l4_2_data:
+        elif "validation" in l4_2_data or "VALIDATION" in l4_2_data:
             ctx.logger.log(self.name, "ERROR", "Layer 4.2 validation field is not an object")
             return False
 
@@ -1399,7 +1406,7 @@ class Pipeline:
                 ctx.errors.append(f"{stage.name} failed")
                 ctx.storage["failed_stage"] = stage.name
                 
-                # Pre-rollback hash validation
+                # Pre-rollback hash validation (scoped strictly to this run_id)
                 root = ctx.manifest_path.parent.parent
                 manifest_path = ctx.manifest_path
                 ledger_path = root / "Artifacts" / "Artifact_Ledger.json"
@@ -1408,15 +1415,15 @@ class Pipeline:
                 if manifest_path.exists() and ledger_path.exists():
                     try:
                         from .lock import locked_read
-                        with locked_read(manifest_path) as m:
-                            pass
-                        with locked_read(ledger_path) as l:
-                            pass
-                        if m and l and isinstance(l, list) and isinstance(m, dict):
-                            # Just a simple validation: see if last entry hash matches manifest
-                            last_art = l[-1].get("artifact") if l else None
-                            last_hash = l[-1].get("hash") if l else None
-                            if last_art and m.get("artifacts", {}).get(last_art, {}).get("hash") != last_hash:
+                        with locked_read(manifest_path, default={}) as m:
+                            manifest_obj = m if isinstance(m, dict) else {}
+                        with locked_read(ledger_path, default=[]) as l:
+                            ledger_list = l if isinstance(l, list) else []
+                        if manifest_obj and ledger_list:
+                            run_entries = [e for e in ledger_list if isinstance(e, dict) and e.get("run_id") == ctx.run_id and e.get("status") == "written"]
+                            last_art = run_entries[-1].get("artifact") if run_entries else None
+                            last_hash = run_entries[-1].get("hash") if run_entries else None
+                            if last_art and manifest_obj.get("artifacts", {}).get(last_art, {}).get("hash") != last_hash:
                                 hash_valid = False
                     except Exception:
                         pass

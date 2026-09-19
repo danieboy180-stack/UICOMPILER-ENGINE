@@ -58,12 +58,6 @@ def write_atomic_artifact(
             "parent_hash": parent_hash,
             "status": "written",
         })
-        
-        uid = uuid.uuid4().hex
-        tmp_artifact = artifact_path.with_suffix(f'.{uid}.tmp')
-        tmp_manifest = manifest_path.with_suffix(f'.{uid}.tmp')
-        tmp_ledger = ledger_path.with_suffix(f'.{uid}.tmp')
-        
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         

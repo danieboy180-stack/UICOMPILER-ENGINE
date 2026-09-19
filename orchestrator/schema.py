@@ -50,11 +50,16 @@ def extract_schema_version(
         if m:
             return m.group(1).strip()
 
-    # 3. Fallback: layer_body (legacy test fixtures support)
+    # 3. Fallback: layer_body (legacy test fixtures or VERSIONING block)
     if isinstance(layer_body, dict):
         val = layer_body.get("schema_version")
         if val is not None:
             return str(val).strip()
+        versioning = layer_body.get("VERSIONING") or layer_body.get("versioning")
+        if isinstance(versioning, dict):
+            val = versioning.get("schema_version")
+            if val is not None:
+                return str(val).strip()
 
     # 4. Fallback: raw_text search
     if isinstance(raw_text, str):
@@ -67,11 +72,12 @@ def extract_schema_version(
 
 def is_valid_schema_version(version: Optional[str]) -> bool:
     """
-    Validate that schema_version is supported ("2.1" or "v2.1").
-    Accepts both "v2.1" (production fused-prompt output) and "2.1" (canonical fixtures).
+    Validate that schema_version is supported ("2.1", "v2.1", "2.1.0", "v2.1.0", etc.).
+    Accepts both "v2.1" / "2.1.0" (production fused-prompt output) and "2.1" (canonical fixtures).
     Rejects missing, empty, or unsupported versions (e.g. "1.0", "3.0").
     """
     if not version:
         return False
-    return version.strip().lower() in VALID_SCHEMA_VERSIONS
+    v = version.strip().lower()
+    return v in VALID_SCHEMA_VERSIONS or v.lstrip("v").startswith("2.1")
 
