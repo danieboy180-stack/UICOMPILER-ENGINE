@@ -7,10 +7,10 @@ Python_Inbox/
 Python_Output/
 Reports/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.bak
 *.lock
 test_*.txt
 scratch*.py
-
-
+BUILD_REPORT.md
