@@ -48,14 +48,14 @@ class RunLogger:
     def __init__(self, root: Path, run_id: str):
         self.log_path = root / "Logs" / f"Run_{run_id}.jsonl"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
     def log(self, step: str, status: str, message: str = ""):
         # Keep printing to stdout for tests
         msg = f"[{step}] {status}"
         if message:
             msg += f" - {mask_secrets(message)}"
         print(msg)
-        
+
         # Write structured JSON lines (O9 Part B Gap 8)
         log_entry = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -133,7 +133,7 @@ class IngestStage(Stage):
 
 class FreezeBoundaryStage(Stage):
     name = "FreezeBoundary"
-    
+
     def _extract_ids(self, data: Any, result: set = None) -> set:
         if result is None: result = set()
         if isinstance(data, dict):
@@ -151,36 +151,36 @@ class FreezeBoundaryStage(Stage):
         root = ctx.manifest_path.parent.parent
         l1_path = root / "Artifacts" / "layer1_ccir.json"
         l2_path = root / "Artifacts" / "layer2_csir.json"
-        
+
         if not l1_path.exists() or not l2_path.exists():
             return True
-            
+
         from .lock import locked_read
         with locked_read(l1_path, default={}) as l1_data:
             ctx.storage["l1_data"] = l1_data
-            
+
         with locked_read(l2_path, default={}) as l2_data:
             ctx.storage["l2_data"] = l2_data
-            
+
         l1_ids = self._extract_ids(ctx.storage["l1_data"])
         l2_ids = self._extract_ids(ctx.storage["l2_data"])
-            
+
         diff = l2_ids - l1_ids
         if diff:
             ctx.logger.log(self.name, "ERROR", f"FREEZE_VIOLATION: L2 invented IDs {diff}")
             ctx.storage["pipeline_status"] = "FREEZE_VIOLATION"
             return False
-            
+
         return True
-        
+
     def failure_code(self, ctx: PipelineContext) -> int:
         return 10  # EXIT_10
 
 class ValidateL1Stage(Stage):
     name = "ValidateL1"
-    
+
     FORBIDDEN_L1_FIELDS = {"component", "template", "navigation_graph", "layout_engine", "region_type", "interaction_graph"}
-    
+
     def _walk_l1(self, data: Any, path: str = "") -> str:
         if isinstance(data, dict):
             for k, v in data.items():
@@ -200,14 +200,14 @@ class ValidateL1Stage(Stage):
         data = ctx.storage.get("l1_data")
         if data is None:
             return True
-            
+
         from .bridge import bridge_l1_to_l2, SchemaBridgeError
         try:
             bridge_l1_to_l2(data)
         except SchemaBridgeError as e:
             ctx.logger.log(self.name, "ERROR", str(e))
             return False
-            
+
         violating_path = self._walk_l1(data)
         if violating_path:
             ctx.logger.log(self.name, "ERROR", f"Forbidden field found at {violating_path}")
@@ -216,7 +216,7 @@ class ValidateL1Stage(Stage):
 
 class ValidateL2Stage(Stage):
     name = "ValidateL2"
-    
+
     def _extract_objects(self, data: Any, result: dict = None) -> dict:
         if result is None: result = {}
         if isinstance(data, dict):
@@ -237,12 +237,12 @@ class ValidateL2Stage(Stage):
                 l1_obj = l1_map.get(obj_id)
                 if not l1_obj:
                     return f"{path} (id: {obj_id} not in Layer1)"
-                
+
                 for k, v in l2_data.items():
                     if k in ("text", "color", "position"):
                         if l1_obj.get(k) is None:
                             return f"{path}.{k}"
-            
+
             for k, v in l2_data.items():
                 current_path = f"{path}.{k}" if path else k
                 res = self._validate_l2(v, l1_map, current_path)
@@ -257,20 +257,20 @@ class ValidateL2Stage(Stage):
     def run(self, ctx: PipelineContext) -> bool:
         l1_data = ctx.storage.get("l1_data")
         l2_data = ctx.storage.get("l2_data")
-        
+
         if l1_data is None or l2_data is None:
             return True
-            
+
         from .bridge import bridge_l2_to_l3, SchemaBridgeError
         try:
             bridge_l2_to_l3(l2_data)
         except SchemaBridgeError as e:
             ctx.logger.log(self.name, "ERROR", str(e))
             return False
-            
+
         l1_map = self._extract_objects(l1_data)
         violating_path = self._validate_l2(l2_data, l1_map)
-        
+
         if violating_path:
             ctx.logger.log(self.name, "ERROR", f"L2 field not traceable to L1 found at {violating_path}")
             return False
@@ -278,9 +278,9 @@ class ValidateL2Stage(Stage):
 
 class ConfidencePropagationStage(Stage):
     name = "ConfidencePropagation"
-    
+
     CONFIDENCE_THRESHOLD = 0.8
-    
+
     def _extract_objects(self, data: Any, result: dict = None) -> dict:
         if result is None: result = {}
         if isinstance(data, dict):
@@ -293,7 +293,7 @@ class ConfidencePropagationStage(Stage):
             for item in data:
                 self._extract_objects(item, result)
         return result
-        
+
     def _propagate(self, l2_data: Any, l1_map: dict):
         if isinstance(l2_data, dict):
             obj_id = l2_data.get("id")
@@ -312,26 +312,45 @@ class ConfidencePropagationStage(Stage):
     def run(self, ctx: PipelineContext) -> bool:
         l1_data = ctx.storage.get("l1_data")
         l2_data = ctx.storage.get("l2_data")
-        
+
         if l1_data is None or l2_data is None:
             return True
-            
+
         l1_map = self._extract_objects(l1_data)
-        
+
         import copy
         l2_updated = copy.deepcopy(l2_data)
         self._propagate(l2_updated, l1_map)
-        
+
         ctx.storage["l2_data"] = l2_updated
-        
-        root = ctx.manifest_path.parent.parent
-        l2_path = root / "Artifacts" / "layer2_csir.json"
-        
-        # Overwrite the artifact on disk so tests and future stages can see it
-        from .lock import locked_write
-        with locked_write(l2_path, l2_updated):
-            pass
-            
+
+        # Layer 2 on disk is FROZEN: its hash is anchored in the ledger/manifest and is the
+        # parent of Layer 3, so it must never be rewritten. Rewriting it made MetaVerify raise
+        # a false "Tampering detected" for any run containing a weak_child. The annotated copy
+        # above is an in-memory view; the untouched original is kept for hash-chain use.
+        ctx.storage["l2_frozen"] = l2_data
+
+        weak_ids = []
+
+        def _collect(node):
+            if isinstance(node, dict):
+                if node.get("weak_child") is True and isinstance(node.get("id"), str):
+                    weak_ids.append(node["id"])
+                for value in node.values():
+                    _collect(value)
+            elif isinstance(node, list):
+                for item in node:
+                    _collect(item)
+
+        _collect(l2_updated)
+        weak_ids = sorted(set(weak_ids))
+        ctx.storage["weak_children"] = weak_ids
+        if weak_ids:
+            ctx.storage.setdefault("warnings", []).append(
+                f"weak_child (confidence < {self.CONFIDENCE_THRESHOLD}): {', '.join(weak_ids)}"
+            )
+            ctx.logger.log(self.name, "WARNING", f"weak_child objects: {', '.join(weak_ids)}")
+
         return True
 
 class Layer3Stage(Stage):
@@ -408,7 +427,7 @@ class Layer3Stage(Stage):
                 continue
             s_id = s.get("id")
             c = candidates_by_id.get(s_id, {})
-            
+
             style = {
                 "background_color": c.get("dominant_color") or c.get("background_color") or c.get("color"),
                 "text_color": c.get("text_color"),
@@ -426,7 +445,7 @@ class Layer3Stage(Stage):
 
         import hashlib
         import json
-        canonical_l2 = json.dumps(l2_data, sort_keys=True, separators=(",", ":"))
+        canonical_l2 = json.dumps(ctx.storage.get("l2_frozen", l2_data), sort_keys=True, separators=(",", ":"))
         input_hash = hashlib.sha256(canonical_l2.encode("utf-8")).hexdigest()
 
         parent_hash = None
@@ -463,7 +482,7 @@ class Layer3Stage(Stage):
 
 class ValidateL3Stage(Stage):
     name = "ValidateL3"
-    
+
     def run(self, ctx: PipelineContext) -> bool:
         root = ctx.manifest_path.parent.parent
         manifest_data = {}
@@ -507,7 +526,7 @@ class ValidateL3Stage(Stage):
         if l3_data is None:
             ctx.logger.log(self.name, "ERROR", "Missing l3_data in pipeline context")
             return False
-            
+
         from .bridge import bridge_l3_to_l4_1, SchemaBridgeError
         try:
             bridge_l3_to_l4_1(l3_data)
@@ -596,34 +615,17 @@ class Layer4_1Stage(Stage):
             return False
 
         visuals = l3_data.get("visuals", [])
-        children = []
-        for v in visuals:
-            v_id = v.get("id")
-            children.append({
-                "id": v_id,
-                "layout": {
-                    "layout_type": "flex_col",
-                    "justify_content": None,
-                    "align_items": None,
-                    "gap": 0,
-                    "margin": {"top": 0, "right": 0, "bottom": 0, "left": 0},
-                    "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0}
-                },
-                "children": []
-            })
 
-        root_tree = {
-            "id": "root_container",
-            "layout": {
-                "layout_type": "flex_col",
-                "justify_content": "flex-start",
-                "align_items": "stretch",
-                "gap": 8,
-                "margin": {"top": 0, "right": 0, "bottom": 0, "left": 0},
-                "padding": {"top": 0, "right": 0, "bottom": 0, "left": 0}
-            },
-            "children": children
-        }
+        # Parent/child relations and row/column layout come from the Layer 1 boxes (spec: Layer 4.1
+        # is algorithmic). Without any boxes this degrades to a flat, deterministic list.
+        l1_data = ctx.storage.get("l1_data")
+        if not l1_data:
+            l1_path = root / "Artifacts" / "layer1_ccir.json"
+            if l1_path.exists():
+                with locked_read(l1_path, default={}) as d:
+                    l1_data = d
+        from .layout import build_semantic_tree
+        root_tree = build_semantic_tree([v.get("id") for v in visuals if isinstance(v, dict)], l1_data)
 
         import hashlib
         import json
@@ -662,9 +664,41 @@ class Layer4_1Stage(Stage):
             return False
 
 
+def _duplicate_ids(tree: Any) -> list:
+    """Ids that occur more than once in a layout tree (iterative, no recursion limit)."""
+    seen, dup, stack = set(), set(), [tree]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        nid = node.get("id")
+        if nid in seen:
+            dup.add(nid)
+        seen.add(nid)
+        stack.extend(node.get("children") or [])
+    return sorted(str(d) for d in dup)
+
+
+def _geometry_violations(tree: Any) -> list:
+    """Parent->child pairs whose child box does not fit inside the parent box (zero/unparsable boxes are skipped)."""
+    from .layout import fits_inside, parse_bbox
+    bad, stack = [], [tree]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        pb = parse_bbox(node.get("bbox"))
+        for child in node.get("children") or []:
+            cb = parse_bbox(child.get("bbox")) if isinstance(child, dict) else None
+            if pb and cb and not fits_inside(pb, cb):
+                bad.append(f"{child.get('id')} not inside {node.get('id')}")
+            stack.append(child)
+    return sorted(bad)
+
+
 class ValidateL4_1Stage(Stage):
     name = "ValidateL4.1"
-    
+
     def _validate_node(self, node: Any, path: str = "root") -> str:
         if not isinstance(node, dict):
             return f"{path} is not an object"
@@ -727,7 +761,7 @@ class ValidateL4_1Stage(Stage):
         if l4_1_data is None:
             ctx.logger.log(self.name, "ERROR", "Missing l4_1_data in pipeline context")
             return False
-            
+
         from .bridge import bridge_l4_1_to_l4_2, SchemaBridgeError
         try:
             bridge_l4_1_to_l4_2(l4_1_data)
@@ -753,6 +787,10 @@ class ValidateL4_1Stage(Stage):
             err = self._validate_node(root_node)
             if err:
                 ctx.logger.log(self.name, "ERROR", f"Semantic tree validation failed: {err}")
+                return False
+            dup = _duplicate_ids(root_node)
+            if dup:
+                ctx.logger.log(self.name, "ERROR", f"Semantic tree has duplicate node ids: {', '.join(dup[:5])}")
                 return False
 
         ctx.logger.log(self.name, "INFO", "ValidateL4_1Stage validation succeeded")
@@ -820,6 +858,13 @@ class Layer4_2Stage(Stage):
         l2_map = {s["id"]: s for s in l2_data.get("semantics", []) if isinstance(s, dict) and "id" in s} if isinstance(l2_data, dict) else {}
         l3_map = {v["id"]: v for v in l3_data.get("visuals", []) if isinstance(v, dict) and "id" in v} if isinstance(l3_data, dict) else {}
 
+        from .layout import ROOT_ID, parse_bbox, union_box
+        screen_box = None
+        if isinstance(l1_data, dict):
+            w_, h_ = l1_data.get("image_width"), l1_data.get("image_height")
+            if isinstance(w_, (int, float)) and isinstance(h_, (int, float)) and w_ > 0 and h_ > 0:
+                screen_box = {"x": 0, "y": 0, "w": int(w_), "h": int(h_)}
+
         def build_component_tree(semantic_node: dict) -> dict:
             n_id = semantic_node.get("id", "unknown")
             l2_info = l2_map.get(n_id, {})
@@ -832,10 +877,20 @@ class Layer4_2Stage(Stage):
             style = l3_info.get("style", {})
             content = l3_info.get("raw_text")
             layout = semantic_node.get("layout", {"layout_type": "flex_col"})
-            
+
             children = []
             for child in semantic_node.get("children", []):
                 children.append(build_component_tree(child))
+
+            if "bbox" not in l1_info:
+                # Synthetic nodes (row/column groups, the root) have no Layer 1 box of their own.
+                if n_id == ROOT_ID and screen_box is not None:
+                    bbox = screen_box
+                else:
+                    child_boxes = [b for b in (parse_bbox(c["bbox"]) for c in children) if b]
+                    if child_boxes:
+                        ux, uy, uw, uh = union_box(child_boxes)
+                        bbox = {"x": ux, "y": uy, "w": uw, "h": uh}
 
             return {
                 "id": n_id,
@@ -970,6 +1025,14 @@ class ValidateL4_2Stage(Stage):
 
         root_node = l4_2_data.get("root_node")
         if isinstance(root_node, dict):
+            dup = _duplicate_ids(root_node)
+            if dup:
+                ctx.logger.log(self.name, "ERROR", f"Execution tree has duplicate node ids: {', '.join(dup[:5])}")
+                return False
+            violations = _geometry_violations(root_node)
+            if violations:
+                ctx.logger.log(self.name, "ERROR", f"Geometry violation: {'; '.join(violations[:5])}")
+                return False
             all_nodes = []
             self._collect_all_nodes(root_node, all_nodes)
             known_ids = {n.get("id") for n in all_nodes if n.get("id")}
@@ -987,7 +1050,7 @@ class ValidateL4_2Stage(Stage):
 
         ctx.logger.log(self.name, "INFO", "ValidateL4_2Stage validation succeeded")
         return True
-    
+
     def failure_code(self, ctx: PipelineContext) -> int:
         return EXIT_20 if ctx.storage.get("force_layer4_2_exit_20") else EXIT_10
 
@@ -997,7 +1060,7 @@ class Layer4_3Stage(Stage):
     def run(self, ctx: PipelineContext) -> bool:
         from .ledger import write_atomic_artifact
         root = ctx.manifest_path.parent.parent
-        
+
         parent_hash = None
         if ctx.manifest_path.exists():
             from .lock import locked_read
@@ -1017,41 +1080,41 @@ class Layer5Stage(Stage):
     def run(self, ctx: PipelineContext) -> bool:
         from .ledger import write_atomic_artifact, record_failed_gate
         root = ctx.manifest_path.parent.parent
-        
+
         # Gap 7 (O12 Fix): Real Subprocess Sandboxing using Docker
         import subprocess
         import os
-        
+
         if ctx.storage.get("force_layer5_malicious"):
             env = os.environ.copy()
             docker_cmd = str(root / "bin" / "docker.bat") if os.name == 'nt' else "docker"
-            
+
             try:
                 # Docker payload simulating execution
                 res = subprocess.run(
                     [
-                        docker_cmd, "run", "--rm", 
-                        "--network", "none", 
-                        "-m", "512m", 
-                        "python:3.9-slim", 
-                        "python", "-c", 
+                        docker_cmd, "run", "--rm",
+                        "--network", "none",
+                        "-m", "512m",
+                        "python:3.9-slim",
+                        "python", "-c",
                         "import urllib.request; urllib.request.urlopen('http://malicious.com')"
                     ],
                     env=env,
                     capture_output=True,
                     text=True
                 )
-                
+
                 # Log the raw Docker output so it can be verified
                 for line in res.stdout.splitlines():
                     ctx.logger.log(self.name, "STDOUT", line)
                 for line in res.stderr.splitlines():
                     ctx.logger.log(self.name, "STDERR", line)
-                    
+
                 if res.returncode != 0:
                     ctx.logger.log(self.name, "WARNING", f"Sandbox container killed or failed (exit code {res.returncode})")
                     return False
-                    
+
             except FileNotFoundError:
                 ctx.logger.log(self.name, "ERROR", "Docker not found in PATH")
                 return False
@@ -1063,7 +1126,7 @@ class Layer5Stage(Stage):
             with locked_read(ctx.manifest_path) as manifest:
                 pass
                 parent_hash = manifest.get("artifacts", {}).get("layer4_3", {}).get("hash")
-        
+
         # Test 1: simulate failed gate
         if ctx.storage.get("force_layer5_failed_gate"):
             record_failed_gate(root, "layer5", ctx.run_id, parent_hash)
@@ -1078,7 +1141,7 @@ class Layer5Stage(Stage):
             with locked_write(output_file, '{"partial": "data"'):
                 pass
             return False
-            
+
         # Normal write (Substage F)
         payload = {"layer": 5, "payload": "completed"}
         try:
@@ -1087,7 +1150,7 @@ class Layer5Stage(Stage):
         except ValueError as e:
             ctx.logger.log(self.name, "ERROR", str(e))
             return False
-        
+
     def failure_code(self, ctx: PipelineContext) -> int:
         if ctx.storage.get("force_layer5_failed_gate"):
             return 30
@@ -1098,13 +1161,13 @@ class Layer6Stage(Stage):
     def run(self, ctx: PipelineContext) -> bool:
         from .ledger import write_atomic_artifact, record_failed_gate
         root = ctx.manifest_path.parent.parent
-        
+
         parent_hash = None
         if ctx.manifest_path.exists():
             from .lock import locked_read
             with locked_read(ctx.manifest_path) as manifest:
                 parent_hash = manifest.get("artifacts", {}).get("layer5", {}).get("hash")
-                
+
         # Normal write (Substage E)
         payload = {"layer": 6, "payload": "completed"}
         try:
@@ -1119,9 +1182,9 @@ class MetaVerifyStage(Stage):
     def run(self, ctx: PipelineContext) -> bool:
         from .meta_verify import verify_integrity
         import json
-        
+
         root = ctx.manifest_path.parent.parent
-        
+
         # Test 1: Tamper with on-disk artifact
         if ctx.storage.get("force_meta_verify_tamper"):
             tamper_file = root / "Artifacts" / "layer6.json"
@@ -1132,7 +1195,7 @@ class MetaVerifyStage(Stage):
                 data["payload"] = "tampered"
                 with locked_write(tamper_file, data):
                     pass
-        
+
         # Test 2: Gap in pointer chain
         if ctx.storage.get("force_meta_verify_gap"):
             ledger_path = root / "Artifacts" / "Artifact_Ledger.json"
@@ -1214,7 +1277,7 @@ class SaveStage(Stage):
         except Exception as exc:
             ctx.logger.log(self.name, "ERROR", f"Save export failed: {exc}")
             return False
-    
+
     def failure_code(self, ctx: PipelineContext) -> int:
         return 50
 
@@ -1228,13 +1291,13 @@ class ArchiveStage(Stage):
 
             root = ctx.manifest_path.parent.parent
             archive_dir = root / "Archives" / f"Run_{ctx.run_id}"
-        
+
             if archive_dir.exists():
                 ctx.logger.log(self.name, "WARNING", f"Archive directory {archive_dir} already exists, aborting to prevent overwrite.")
                 return False
-            
+
             archive_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # 1. Copy Artifacts/
             artifacts_src = root / "Artifacts"
             artifacts_dest = archive_dir / "Artifacts"
@@ -1248,7 +1311,7 @@ class ArchiveStage(Stage):
                         if content is not None:
                             with locked_write(artifacts_dest / relative, content):
                                 pass
-            
+
         # 2. Copy manifest
             manifest_src = root / "Manifest" / f"manifest_{ctx.run_id}.json"
             if manifest_src.exists():
@@ -1257,7 +1320,7 @@ class ArchiveStage(Stage):
                     if content is not None:
                         with locked_write(archive_dir / f"manifest_{ctx.run_id}.json", content):
                             pass
-            
+
         # 3. Pipeline_Ledger entry for this run
             ledger_src = root / "Logs" / "Pipeline_Ledger.json"
             if ledger_src.exists():
@@ -1270,7 +1333,7 @@ class ArchiveStage(Stage):
                 if run_entry:
                     with locked_write(archive_dir / "Pipeline_Ledger.json", [run_entry]):
                         pass
-                    
+
         # 4. Copy BUILD_REPORT.md
             build_report_src = root / "BUILD_REPORT.md"
             if build_report_src.exists():
@@ -1279,14 +1342,14 @@ class ArchiveStage(Stage):
                     if content is not None:
                         with locked_write(archive_dir / "BUILD_REPORT.md", content):
                             pass
-            
+
         # Set entire copy to read-only
             def set_readonly(path):
                 try:
                     os.chmod(path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
                 except OSError:
                     pass
-            
+
             for dirpath, dirnames, filenames in os.walk(archive_dir):
                 set_readonly(dirpath)
                 for filename in filenames:
@@ -1306,19 +1369,20 @@ class PipelineLedgerStage(Stage):
         from .ledger import write_pipeline_ledger
         import time
         root = ctx.manifest_path.parent.parent
-        
+
         status = ctx.storage.get("pipeline_status", "PASS")
         duration = time.time() - ctx.storage.get("start_time", time.time())
-        files_produced = 3 if status == "PASS" else 0
+        from .ledger import count_written_artifacts
+        files_produced = count_written_artifacts(root / "Artifacts" / "Artifact_Ledger.json", ctx.run_id) if status == "PASS" else 0
         hash_chain_valid = ctx.storage.get("hash_chain_valid", True)
-        
+
         write_pipeline_ledger(
             root=root,
             run_id=ctx.run_id,
             status=status,
             duration_seconds=round(duration, 2),
             files_produced=files_produced,
-            warnings=[],
+            warnings=list(ctx.storage.get("warnings", [])),
             errors=ctx.errors,
             hash_chain_valid=hash_chain_valid
         )
@@ -1388,9 +1452,9 @@ class Pipeline:
         from .checkpoint import RollbackStage
         import time
         import json
-        
+
         ctx.storage["start_time"] = time.time()
-        
+
         for idx, stage in enumerate(self.stages):
             ctx.logger.log(stage.name, "STARTING")
             try:
@@ -1400,36 +1464,31 @@ class Pipeline:
                 success = False
             except Exception as exc:
                 ctx.logger.log(stage.name, "ERROR", f"Stage failed with exception: {exc}")
+                import traceback
+                ctx.logger.log(stage.name, "TRACEBACK", traceback.format_exc())
                 success = False
             if not success:
                 ctx.logger.log(stage.name, "FAILED")
                 ctx.errors.append(f"{stage.name} failed")
                 ctx.storage["failed_stage"] = stage.name
-                
+
                 # Pre-rollback hash validation (scoped strictly to this run_id)
                 root = ctx.manifest_path.parent.parent
                 manifest_path = ctx.manifest_path
                 ledger_path = root / "Artifacts" / "Artifact_Ledger.json"
-                hash_valid = True
-                
-                if manifest_path.exists() and ledger_path.exists():
-                    try:
-                        from .lock import locked_read
-                        with locked_read(manifest_path, default={}) as m:
-                            manifest_obj = m if isinstance(m, dict) else {}
-                        with locked_read(ledger_path, default=[]) as l:
-                            ledger_list = l if isinstance(l, list) else []
-                        if manifest_obj and ledger_list:
-                            run_entries = [e for e in ledger_list if isinstance(e, dict) and e.get("run_id") == ctx.run_id and e.get("status") == "written"]
-                            last_art = run_entries[-1].get("artifact") if run_entries else None
-                            last_hash = run_entries[-1].get("hash") if run_entries else None
-                            if last_art and manifest_obj.get("artifacts", {}).get(last_art, {}).get("hash") != last_hash:
-                                hash_valid = False
-                    except Exception:
-                        pass
-                
+                from .ledger import verify_manifest_ledger_consistency
+                hash_valid, hash_problems = verify_manifest_ledger_consistency(manifest_path, ledger_path, ctx.run_id)
+                if stage is self.meta_verify_stage and hash_valid:
+                    # MetaVerify only fails on a hash mismatch, a pointer-chain gap or an
+                    # unreadable ledger/manifest -> by definition the chain is NOT intact, even
+                    # when the manifest and ledger still agree with each other (tampered artifact).
+                    hash_valid = False
+                    hash_problems = ["MetaVerify failed: on-disk artifacts do not match the ledger/manifest hash chain"]
+                for problem in hash_problems:
+                    ctx.logger.log("HashChain", "ERROR", problem)
+
                 ctx.storage["hash_chain_valid"] = hash_valid
-                
+
                 non_rollback_stages = {
                     self.ingest_stage.name,
                     self.meta_verify_stage.name,
@@ -1447,23 +1506,23 @@ class Pipeline:
                         ctx.logger.log("Rollback", "FAILED")
                     else:
                         ctx.logger.log("Rollback", "PASSED")
-                        
+
                 if "pipeline_status" not in ctx.storage:
                     ctx.storage["pipeline_status"] = "ROLLED_BACK" if should_rollback else "FAIL"
-                
+
                 # Write the pipeline ledger through its stage reference
                 try:
                     self._stage_by_class["PipelineLedgerStage"].run(ctx)
                 except Exception as exc:
                     ctx.logger.log("PipelineLedger", "ERROR", f"Shared-file access failed: {exc}")
-                
+
                 # Generate the build report through its stage reference
                 try:
                     self._stage_by_class["BuildReportStage"].run(ctx)
                 except Exception as exc:
                     ctx.logger.log("BuildReport", "ERROR", f"Shared-file access failed: {exc}")
-                
+
                 return stage.failure_code(ctx)
             ctx.logger.log(stage.name, "PASSED")
-            
+
         return EXIT_OK
