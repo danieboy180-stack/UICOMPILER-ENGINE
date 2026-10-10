@@ -57,19 +57,20 @@ test report
         write_inbox(root, "layer12_bundle.txt", content)
         result = run(root)
         assert result.returncode == 0, result.stderr
-        
+
         # Verify it was moved
         assert not (root / "Python_Inbox" / "layer12_bundle.txt").exists()
         assert (root / "Artifacts" / "layer1_ccir.json").exists()
         assert (root / "Artifacts" / "layer2_csir.json").exists()
-        
+
         from verification.receipt import record_verification
-        record_verification("test_split_ingest", "Valid split bundle ingested", str(result.stdout) + "\n" + str(result.stderr) + "\n" + "\n".join(["padding"]*10), True)
-        
+        from verification.receipt import ingest_evidence
+        record_verification("test_split_ingest", "Valid split bundle ingested", ingest_evidence(root, result), True)
+
         from orchestrator.lock import locked_read
         with locked_read(root / "Artifacts" / "Artifact_Ledger.json") as ledger:
             pass
-            
+
         assert len(ledger) == 2
         artifacts = {e["artifact"] for e in ledger}
         assert "layer1_ccir" in artifacts
