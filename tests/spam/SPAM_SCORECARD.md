@@ -10,25 +10,33 @@
   - Byte-level Garbage: 60
 
 ## Outcomes by Category
-- **a. Valid**: Pass: 0, Fail: 50, Crash: 0, Hang: 0, Silent Drop: 0
-- **b. Malformed Schema**: Pass: 0, Fail: 20, Crash: 0, Hang: 0, Silent Drop: 0
-- **c. Boundary/Edge**: Pass: 0, Fail: 24, Crash: 0, Hang: 0, Silent Drop: 0
-- **d. Adversarial**: Pass: 0, Fail: 48, Crash: 0, Hang: 0, Silent Drop: 0
-- **e. Byte-level Garbage**: Pass: 0, Fail: 60, Crash: 0, Hang: 0, Silent Drop: 0
+- **a. Valid**: Accepted (or duplicate rejected): 50, Rejected: 0, Crash: 0, Hang: 0, Silent Drop: 0
+- **b. Malformed Schema**: Accepted (or duplicate rejected): 6, Rejected: 14, Crash: 0, Hang: 0, Silent Drop: 0
+- **c. Boundary/Edge**: Accepted (or duplicate rejected): 18, Rejected: 6, Crash: 0, Hang: 0, Silent Drop: 0
+- **d. Adversarial**: Accepted (or duplicate rejected): 42, Rejected: 6, Crash: 0, Hang: 0, Silent Drop: 0
+- **e. Byte-level Garbage**: Accepted (or duplicate rejected): 0, Rejected: 60, Crash: 0, Hang: 0, Silent Drop: 0
 
 ## Critical Findings
 No critical findings (crashes, hangs, silent drops) occurred.
 
-## O12 Fix Validations
-- **Concurrency (Isolated Manifests)**: Verified. Threads processed concurrently and generated independent manifest_{run_id}.json without data races.
-- **Idempotency Scope**: Verified. Duplicates in 'proj_A' were correctly rejected. Duplicates across different projects were correctly ingested independently.
+## Expectations (computed from this run)
 
-## O9 Dimension Scoring (Post-O14 Spam Run)
-
-| Dimension | Score | Justification |
+| Expectation | Result | Observed |
 | :--- | :--- | :--- |
-| **Production-grade** | **10/10** | Held up perfectly to adversarial inputs and byte garbage. |
-| **Scalability** | **10/10** | Processed 200+ concurrent requests efficiently without bottlenecking. |
-| **Solo-dev maintainability** | **10/10** | Failures were gracefully handled with clear logs. |
-| **Durability** | **10/10** | No silent state corruption or lost bundles observed. |
-| **Security posture** | **10/10** | Safely contained path traversal (e.g. `../../../malicious`) and binary garbage without executing it. |
+| No crash, hang or silent drop in any category | PASS | crashes=0 hangs=0 silent drops=0 |
+| Invalid bundles (malformed, edge, adversarial, garbage) are never accepted as new runs | PASS | b: 0, c: 0, d: 0, e: 0 |
+| Every valid bundle is accepted (or rejected as a duplicate) | PASS | 50/50 |
+| Same content, same project: first accepted, the rest rejected as duplicates | PASS | 5 bundles, 1 accepted, 4 rejected |
+| Same content, different projects: all accepted | PASS | 5/5 accepted |
+
+## Accepted as a NEW run, by category
+
+| Category | Accepted as a new run |
+| :--- | :--- |
+| Valid | 46 of 50 |
+| Malformed Schema | 0 of 20 |
+| Boundary/Edge | 0 of 24 |
+| Adversarial | 0 of 48 |
+| Byte-level Garbage | 0 of 60 |
+
+This scorecard reports what was measured. It deliberately assigns no quality scores.
