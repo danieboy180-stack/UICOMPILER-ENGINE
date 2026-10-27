@@ -22,6 +22,7 @@ Invariants:
 - **Confidence propagation** – candidates below 0.8 confidence are flagged `weak_child` in memory and reported as run warnings.
 - **Layout inference (Layer 4.1)** – `orchestrator/layout.py` builds the tree from Layer 1 boxes: smallest enclosing box is the parent (content that overflows its container by a few px still belongs to it), vertical flex stacks with nested rows via recursive row/column cuts, and absolute positioning wherever boxes overlap. Pure and deterministic: the result does not depend on input order.
 - **Geometry gate** – ValidateL4.1/4.2 reject duplicate ids and children that do not fit inside their parent box (same predicate the inference uses).
+- **One run at a time per project** – runs share `Artifacts/`, so they are serialized by `.pipeline_run.lock` (a second run waits its turn, or fails cleanly after `Pipeline.RUN_LOCK_TIMEOUT`). `ingest.ingest_bundle` hands the run id back to `IngestStage`, so a pipeline never adopts someone else's run, a duplicate bundle halts at Ingest, and a finished (archived) run cannot be re-run.
 - **Rollback** – a failing stage restores the last checkpointed manifest and moves its output to `Python_Output/runs/<run_id>/FAILED_*.json`.
 
 ## Quick start
@@ -61,7 +62,7 @@ python ci_gate.py
 ```
 
 Runs the static test linter (`verification/lint_tests.py`), the full pytest suite, and checks that
-verification receipts were recorded. Every passing test must contain a real assertion or a receipt.
+verification receipts were recorded. Every passing test must contain a real assertion or a receipt, and receipts must carry real captured evidence: placeholder or repeated lines are rejected by `record_verification`.
 A ready-made GitHub Actions workflow for the same gate is in `tools/ci/ci.yml` (copy it to `.github/workflows/ci.yml` to enable CI).
 
 ## Real-data check
@@ -81,8 +82,20 @@ the thresholds below in CI. Measured on 34 real single-screen renders (632 eleme
 The few remaining parent misses are DOM siblings whose boxes overlap, which geometry alone cannot separate.
 Only 3 flex containers were scoreable (most flex rows wrap invisible elements), so treat direction/gap as a small sample.
 
+## Accuracy harness
+
+The scoping doc's success criterion (IoU of boxes and role accuracy against hand-labeled Layer 4.2 JSON, 90 % gate) is measured by
+`tools/eval/score_accuracy.py`:
+
+```bash
+python tools/eval/score_accuracy.py --labels labels/ --preds preds/ [--min-iou 0.9] [--min-role 0.9]
+```
+
+Both folders hold one Layer 4.2 JSON per screen, paired by file name; a screen without a prediction scores zero and fails the gate.
+Row/column wrapper nodes the engine invents, and the root, are transparent. It needs your labeled screens and your pipeline's output.
+
 ## Status and limits
 
 - Layers 1-2 arrive as LLM output; Layer 3 carries their style/text fields; Layers 4.1 and 4.2 are inferred deterministically from the Layer 1 boxes (or ingested via the layer-342 bundle).
-- There is no CV/VLM code in this repo yet, so the 50-screenshot / 90 % target in `L1_42_SCOPING_DOC.md` is not measured. The real-data check above scores Layers 3-4.2 on DOM-derived boxes, not on pixels.
+- There is no CV/VLM code in this repo yet, so the 50-screenshot / 90 % target in `L1_42_SCOPING_DOC.md` is not measured here (the scorer above is ready for your labeled screens). The real-data check above scores Layers 3-4.2 on DOM-derived boxes, not on pixels.
 - `AUDIT_*.md` are point-in-time snapshots; some findings in them (stubbed stages, hard-coded stage indexes) were fixed afterwards.

@@ -11,41 +11,41 @@ def generate_build_report(root: Path, run_id: str, logger=None) -> bool:
             with locked_read(pipeline_ledger, default=[]) as ledger:
                 if isinstance(ledger, list):
                     pl_data = next((e for e in ledger if isinstance(e, dict) and e.get("run_id") == run_id), {})
-                
+
         al_data = []
         if artifact_ledger.exists():
             with locked_read(artifact_ledger, default=[]) as ledger:
                 if isinstance(ledger, list):
                     al_data = [e for e in ledger if isinstance(e, dict) and e.get("run_id") == run_id]
-            
+
         layers_executed = [e.get("artifact", "unknown") for e in al_data if isinstance(e, dict) and e.get("status") == "written"]
-    
+
         hash_chain = []
         for e in al_data:
             if isinstance(e, dict) and e.get("status") == "written":
                 hash_chain.append(f"  - {e.get('artifact', 'unknown')}: {e.get('hash', 'unknown')}")
         hash_chain_str = "\n".join(hash_chain) if hash_chain else "  None"
-    
+
         compiler_ver = pl_data.get('compiler_version', 'v2.1') if isinstance(pl_data, dict) else 'v2.1'
         duration = pl_data.get('duration_seconds', 0.0) if isinstance(pl_data, dict) else 0.0
         files_prod = pl_data.get('files_produced', 0) if isinstance(pl_data, dict) else 0
         warnings_list = pl_data.get('warnings', []) if isinstance(pl_data, dict) else []
         errors_list = pl_data.get('errors', []) if isinstance(pl_data, dict) else []
         integrity = 'PASS' if isinstance(pl_data, dict) and pl_data.get('hash_chain_valid') else 'FAIL'
-        fidelity = "N/A (Failed)" if (not isinstance(pl_data, dict) or pl_data.get("status") != "PASS") else "100%"
-        
+        fidelity = "N/A (Failed)" if (not isinstance(pl_data, dict) or pl_data.get("status") != "PASS") else "N/A (not measured)"
+
         # Stage 7: Post-run lint
         from .lint import post_run_lint
         archive_dir = root / "Archives" / f"Run_{run_id}"
         lint_violations = []
         if archive_dir.exists():
             lint_violations = post_run_lint(archive_dir)
-            
+
         lint_section = "None"
         if lint_violations:
             lint_section = "\n" + "\n".join(f"  - {v}" for v in lint_violations)
             integrity = 'FAIL'
-    
+
         report_content = f"""# BUILD REPORT: {run_id}
 
 1. **pipeline_version**: v2.1
@@ -82,4 +82,3 @@ def generate_build_report(root: Path, run_id: str, logger=None) -> bool:
         if logger is not None:
             logger.log("BuildReport", "ERROR", f"Build report failed: {exc}")
         return False
-

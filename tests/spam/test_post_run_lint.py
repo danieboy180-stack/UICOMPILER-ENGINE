@@ -153,6 +153,7 @@ def test_post_run_lint_catches_aggregate_only_violation():
         assert report_path.exists(), f"BUILD_REPORT.md not created at {report_path}"
 
         content = report_path.read_text(encoding="utf-8")
+        lint_content = content
 
         # The report must include the aggregate lint section
         assert "aggregate_lint_violations" in content, (
@@ -167,6 +168,16 @@ def test_post_run_lint_catches_aggregate_only_violation():
         assert "compiler_integrity**: FAIL" in content or "compiler_integrity: FAIL" in content, (
             "compiler_integrity must be FAIL when aggregate lint violations are present"
         )
+
+        import json
+        from verification.receipt import record_verification
+        evidence = ["planted violation: Layer2 text 'GHOST_TEXT' does not exist in Layer1",
+                    f"violations found: {len(violations)}", f"violation: {violations[0]}",
+                    f"layer1: {json.dumps(l1_data, sort_keys=True)}", f"layer2: {json.dumps(l2_data, sort_keys=True)}",
+                    f"layer3: {json.dumps(l3_data, sort_keys=True)}"]
+        evidence += [f"BUILD_REPORT.md: {line}" for line in lint_content.splitlines() if line.strip()]
+        record_verification("Stage7-AggLint", "One planted violation caught and written to BUILD_REPORT.md",
+                            "\n".join(evidence), True)
 
 
 # ---------------------------------------------------------------------------
@@ -207,27 +218,20 @@ def test_post_run_lint_clean_pass():
             f"Expected zero violations for clean artifacts, got: {violations}"
         )
 
+        import json
+        from verification.receipt import record_verification
+        evidence = ["clean artifact set: the aggregate lint must find zero violations",
+                    f"layer1: {json.dumps(l1_data, sort_keys=True)}", f"layer2: {json.dumps(l2_data, sort_keys=True)}",
+                    f"layer3: {json.dumps(l3_data, sort_keys=True)}", f"violations returned: {violations}",
+                    f"violation count: {len(violations)}",
+                    "L2 text 'Submit' is traceable to L1 ocr_text", "L3 color '#0000FF' is traceable to L1 dominant_color"]
+        evidence += [f"archived file: {p.relative_to(archive_dir)} ({p.stat().st_size} bytes)"
+                     for p in sorted(archive_dir.rglob("*")) if p.is_file()]
+        record_verification("Stage7-AggLint-clean", "Clean artifact set yields zero violations (no false positives)",
+                            "\n".join(evidence), True)
+
 
 if __name__ == "__main__":
     test_post_run_lint_catches_aggregate_only_violation()
     test_post_run_lint_clean_pass()
-    from verification.receipt import record_verification
-    record_verification(
-        "Stage7-AggLint",
-        "Post-run aggregate lint: one planted violation caught; clean set yields zero violations",
-        (
-            "test_post_run_lint_catches_aggregate_only_violation: PASS\n"
-            "test_post_run_lint_clean_pass: PASS\n"
-            "Violation format verified: layer: field: violation\n"
-            "GHOST_TEXT found in Layer2 field\n"
-            "BUILD_REPORT.md contains aggregate_lint_violations section\n"
-            "compiler_integrity set to FAIL on violations\n"
-            "Clean artifact set: 0 violations (no false positives)\n"
-            "All assertions passed\n"
-            "Stage 7 lint gate: COMPLETE\n"
-            "padding\n"
-            "padding\n"
-        ),
-        True,
-    )
     print("PASS test_post_run_lint")

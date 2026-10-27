@@ -110,12 +110,18 @@ def _commit_outputs(root: Path, outputs: dict[Path, Any], run_id: str) -> None:
             safe_unlink(root / item["backup"])
         safe_unlink(transaction_path)
 
-def ingest(root: Path) -> int:
+def ingest_bundle(root: Path) -> tuple[int, Optional[str], str]:
+    """Ingest one bundle from Python_Inbox.
+
+    Returns ``(exit_code, run_id, outcome)`` where outcome is ``ingested`` (run_id is the run just created),
+    ``empty`` (nothing to do), ``duplicate`` (already processed, rejected) or ``invalid``. Callers get the run id
+    directly instead of having to guess which manifest is theirs.
+    """
     root = root.resolve()
     inbox = root / "Python_Inbox"
     selected = next((inbox / name for name in sorted(ALLOWED_FILES) if (inbox / name).is_file()), None)
     if selected is None:
-        return EXIT_OK
+        return EXIT_OK, None, "empty"
 
     original_name = selected.name
     original_path = inbox / original_name
@@ -124,7 +130,7 @@ def ingest(root: Path) -> int:
         os.rename(selected, processing_path)
         selected = processing_path
     except OSError:
-        return EXIT_OK
+        return EXIT_OK, None, "empty"
 
     def _restore_inbox():
         try:
@@ -145,7 +151,7 @@ def ingest(root: Path) -> int:
         if not l1_match or not l2_match:
             print("[Ingest] ERROR: Missing <LAYER1_OUTPUT> or <LAYER2_OUTPUT>")
             _restore_inbox()
-            return EXIT_10
+            return EXIT_10, None, "invalid"
 
         layer1_raw = json.loads(l1_match.group(1).strip())
         layer2_raw = json.loads(l2_match.group(1).strip())
@@ -170,14 +176,14 @@ def ingest(root: Path) -> int:
         if not is_valid_schema_version(schema_ver):
             print(f"[Ingest] ERROR: Unsupported schema version '{schema_ver}'. Expected '2.1' or 'v2.1'.")
             _restore_inbox()
-            return EXIT_10
+            return EXIT_10, None, "invalid"
 
         validated_l1 = _model_validate(Layer1CCIR, layer1_raw)
 
     except (OSError, json.JSONDecodeError, ValidationError, TypeError, ValueError) as e:
         print(f"[Ingest] Validation failed: {e}")
         _restore_inbox()
-        return EXIT_10
+        return EXIT_10, None, "invalid"
 
     data1 = _model_dump(validated_l1)
     # Re-merge any other fields dynamically since BaseModel might drop them if not defined,
@@ -200,7 +206,7 @@ def ingest(root: Path) -> int:
             # Imported lazily like the other helpers in this module (orchestrator imports ingest).
             from orchestrator.lock import safe_unlink
             safe_unlink(selected)
-            return EXIT_OK
+            return EXIT_OK, None, "duplicate"
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
     timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -238,7 +244,7 @@ def ingest(root: Path) -> int:
     }
 
     if not isinstance(ledger, list):
-        return EXIT_10
+        return EXIT_10, None, "invalid"
 
     ledger.append(entry1)
     ledger.append(entry2)
@@ -269,8 +275,12 @@ def ingest(root: Path) -> int:
         if destination.exists() and not selected.exists():
             selected.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(destination), str(selected))
-        return EXIT_10
-    return EXIT_OK
+        return EXIT_10, None, "invalid"
+    return EXIT_OK, run_id, "ingested"
+
+def ingest(root: Path) -> int:
+    """Back-compatible entry point: the exit code only (see ingest_bundle for the run id)."""
+    return ingest_bundle(root)[0]
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Resolve allow-listed Python_Inbox bundles.")

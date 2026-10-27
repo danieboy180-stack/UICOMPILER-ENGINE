@@ -55,13 +55,14 @@ def test_valid_bundle() -> None:
         result = run(root)
         print(result.stdout)
         assert result.returncode == 0, result.stderr
-        
+
         # Verify it was moved
         assert not (root / "Python_Inbox" / "layer12_bundle.txt").exists()
         assert (root / "Artifacts" / "layer1_ccir.json").exists()
-        
+
         from verification.receipt import record_verification
-        record_verification("test_ingest", "Valid bundle ingested", str(result.stdout) + "\n" + str(result.stderr) + "\n" + "\n".join(["padding"]*10), True)
+        from verification.receipt import ingest_evidence
+        record_verification("test_ingest", "Valid bundle ingested", ingest_evidence(root, result), True)
         from orchestrator.lock import locked_read
         with locked_read(root / "Artifacts" / "layer1_ccir.json") as artifact:
             pass
@@ -70,7 +71,7 @@ def test_valid_bundle() -> None:
             pass
         with locked_read(root / "Artifacts" / "Artifact_Ledger.json") as ledger:
             pass
-        
+
         assert artifact["payload"] == {"x": 1}
         assert ledger[0]["artifact"] == "layer1_ccir"
         assert manifest["artifacts"]["layer1_ccir"]["hash"] == ledger[0]["hash"] == __import__("hashlib").sha256(

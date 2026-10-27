@@ -82,54 +82,34 @@ class IngestStage(Stage):
     name = "Ingest"
     def run(self, ctx: PipelineContext) -> bool:
         root = ctx.manifest_path.parent.parent
-        # Record time just before calling ingest so we can identify the manifest IT wrote
-        import time as _time
-        call_ts = _time.time()
-        res = ingest.ingest(root)
-        if res == ingest.EXIT_OK:
-            # Identify the manifest ingest.py just wrote by scanning for files written
-            # AFTER our call_ts. Under concurrency, other threads may have written older
-            # manifests — we must only accept our own (most recent, post-call_ts).
-            try:
-                manifest_dir = root / "Manifest"
-                manifest_dir.mkdir(parents=True, exist_ok=True)
-                # Collect manifests written after we called ingest
-                fresh = []
-                for mf in manifest_dir.glob("manifest_*.json"):
-                    try:
-                        if mf.stat().st_mtime >= call_ts - 0.5:  # 0.5s grace for clock skew
-                            fresh.append(mf)
-                    except OSError:
-                        pass
-                # Sort newest-first and pick the one that has a matching run_id in its content
-                fresh.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                for mf in fresh:
-                    try:
-                        from .lock import locked_read
-                        with locked_read(mf) as manifest:
-                            pass
-                        run_id = manifest.get("run_id")
-                        if run_id and mf.name == f"manifest_{run_id}.json":
-                            ctx.run_id = run_id
-                            ctx.manifest_path = mf
-                            ctx.logger = RunLogger(root, run_id)
-                            break
-                    except (OSError, json.JSONDecodeError):
-                        pass
-            except Exception:
-                pass
-
-            # CRITICAL GATE (O15 Fix): If run_id is still None, ingest processed nothing
-            # (empty inbox, duplicate rejection, or garbage file). Do NOT let downstream stages
-            # proceed with a null run_id — that crashes CheckpointStage and others.
-            if ctx.run_id is None:
-                ctx.logger.log(self.name, "INFO", "No bundle processed (empty inbox, duplicate, or invalid). Halting pipeline cleanly.")
-                return False
-
-            return True
-        else:
+        # ingest hands back the run it created, so this stage never has to guess which manifest is ours by file
+        # modification time (that adopted another pipeline's run when several share a project root).
+        res, run_id, outcome = ingest.ingest_bundle(root)
+        if res != ingest.EXIT_OK:
             ctx.logger.log(self.name, "ERROR", f"ingest.ingest returned {res}")
             return False
+
+        if outcome == "ingested":
+            ctx.run_id = run_id
+            ctx.manifest_path = root / "Manifest" / f"manifest_{run_id}.json"
+            ctx.logger = RunLogger(root, run_id)
+            return True
+
+        if outcome == "duplicate":
+            ctx.logger.log(self.name, "INFO", "Duplicate bundle already processed; nothing new to run. Halting pipeline cleanly.")
+            return False
+
+        # Empty inbox. A caller that supplied a run_id may be resuming from artifacts already on disk; without one
+        # there is nothing to run (a null run_id crashes CheckpointStage and others).
+        if ctx.run_id is None:
+            ctx.logger.log(self.name, "INFO", "No bundle processed (empty inbox). Halting pipeline cleanly.")
+            return False
+        if (root / "Archives" / f"Run_{ctx.run_id}").exists():
+            # Re-running a finished run would append duplicate artifacts to its ledger and break the pointer chain
+            # before Archive could object. Refuse up front; the archive is immutable.
+            ctx.logger.log(self.name, "ERROR", f"Run {ctx.run_id} is already archived; refusing to re-run it.")
+            return False
+        return True
 
 class FreezeBoundaryStage(Stage):
     name = "FreezeBoundary"
@@ -1344,14 +1324,19 @@ class ArchiveStage(Stage):
                             pass
 
         # Set entire copy to read-only
-            def set_readonly(path):
+            def set_readonly(path, is_dir=False):
+                # Directories keep their execute bit (r-x): without it nobody but root can enter the archive, and
+                # os.walk silently skips everything below it, so the files inside would never become read-only.
+                mode = stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH
+                if is_dir:
+                    mode |= stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
                 try:
-                    os.chmod(path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+                    os.chmod(path, mode)
                 except OSError:
                     pass
 
             for dirpath, dirnames, filenames in os.walk(archive_dir):
-                set_readonly(dirpath)
+                set_readonly(dirpath, is_dir=True)
                 for filename in filenames:
                     set_readonly(os.path.join(dirpath, filename))
 
@@ -1448,7 +1433,25 @@ class Pipeline:
         ]
         self._stage_by_class = {type(s).__name__: s for s in self.stages}
 
+    RUN_LOCK_TIMEOUT = 600.0  # seconds a run waits for another run on the same project root
+
     def run(self, ctx: PipelineContext) -> int:
+        """Run the pipeline. Runs are serialized per project root: every run writes into the shared Artifacts/
+        directory, so two concurrent runs overwrite each other's files and then fail MetaVerify (or worse, mix
+        provenance). A second run simply waits its turn."""
+        from contextlib import ExitStack
+        from .lock import simple_file_lock
+        root = ctx.manifest_path.parent.parent
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(simple_file_lock(root / ".pipeline_run", timeout=self.RUN_LOCK_TIMEOUT))
+            except TimeoutError:
+                ctx.logger.log("Pipeline", "ERROR", "Another pipeline holds this project's run lock; gave up waiting.")
+                ctx.errors.append("Pipeline run lock timeout")
+                return EXIT_10
+            return self._run_locked(ctx)
+
+    def _run_locked(self, ctx: PipelineContext) -> int:
         from .checkpoint import RollbackStage
         import time
         import json

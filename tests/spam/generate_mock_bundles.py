@@ -7,7 +7,7 @@ def generate_bundles():
     root = Path.cwd()
     inbox = root / "Python_Inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    
+
     # clear inbox first
     for f in inbox.iterdir():
         if f.is_file():
@@ -15,10 +15,10 @@ def generate_bundles():
 
     counts = {'a': 0, 'b': 0, 'c': 0, 'd': 0, 'e': 0}
 
-    def write_bundle(name, content, is_json=True):
+    def write_bundle(name, content, is_json=True, l2=None):
         path = inbox / name
         if is_json and isinstance(content, (dict, list)):
-            text = f"<LAYER1_OUTPUT>\n{json.dumps(content)}\n</LAYER1_OUTPUT>\n<LAYER2_OUTPUT>\n{{}}\n</LAYER2_OUTPUT>\n<MANIFEST_UPDATE>\n{{}}\n</MANIFEST_UPDATE>\n<REPORT>\n</REPORT>"
+            text = f"<LAYER1_OUTPUT>\n{json.dumps(content)}\n</LAYER1_OUTPUT>\n<LAYER2_OUTPUT>\n{json.dumps(l2 if l2 is not None else {})}\n</LAYER2_OUTPUT>\n<MANIFEST_UPDATE>\n{{}}\n</MANIFEST_UPDATE>\n<REPORT>\n</REPORT>"
             if path.suffix == '.json':
                 path = path.with_suffix('.txt')
             path.write_text(text, encoding='utf-8')
@@ -31,35 +31,35 @@ def generate_bundles():
                 path = path.with_suffix('.txt')
             path.write_bytes(content)
 
-    # a. Valid bundles (20+)
+    def valid_l1(project_id, seed):
+        """A Layer 1 bundle that satisfies the current contract (candidates with boxes), unique per seed."""
+        return {"schema_version": "2.1", "project_id": project_id, "image_width": 390, "image_height": 844,
+                "candidates": [
+                    {"id": f"ctr-{seed}", "bbox": {"x": 10, "y": 10, "w": 370, "h": 200}, "confidence": 0.97},
+                    {"id": f"txt-{seed}", "bbox": {"x": 20, "y": 20, "w": 200, "h": 24}, "confidence": 0.95, "ocr_text": f"Title {seed}"},
+                    {"id": f"btn-{seed}", "bbox": {"x": 20, "y": 150, "w": 100, "h": 40}, "confidence": 0.93, "ocr_text": "OK"}]}
+
+    def valid_l2(seed):
+        return {"schema_version": "2.1", "semantics": [
+            {"id": f"ctr-{seed}", "semantic_role": "container", "semantic_variant": "card"},
+            {"id": f"txt-{seed}", "semantic_role": "text", "semantic_variant": "heading"},
+            {"id": f"btn-{seed}", "semantic_role": "button", "semantic_variant": "primary"}]}
+
+    # a. Valid bundles: these must run the whole pipeline successfully
     for i in range(40):
-        write_bundle(f"valid_{i}.json", {
-            "schema_version": "2.1",
-            "project_id": f"proj_A" if i < 10 else f"proj_B", # To test idempotency duplicate hashes
-            "layer": 12,
-            "payload": {"view_hierarchy": {"type": "window", "id": str(uuid.uuid4())}, "index": i, "_cat": "a"}
-        })
+        # first 10 in proj_A, the rest in proj_B (idempotency is scoped per project)
+        write_bundle(f"valid_{i}.json", valid_l1("proj_A" if i < 10 else "proj_B", f"v{i}"), l2=valid_l2(f"v{i}"))
         counts['a'] += 1
-        
+
     # Idempotency checks: Exact duplicates
     # Same content, same project -> should drop
     for i in range(5):
-        write_bundle(f"valid_dup_same_proj_{i}.json", {
-            "schema_version": "2.1",
-            "project_id": "proj_A",
-            "layer": 12,
-            "payload": {"view_hierarchy": {"type": "window", "id": "fixed_id_123"}, "index": "fixed"}
-        })
+        write_bundle(f"valid_dup_same_proj_{i}.json", valid_l1("proj_A", "same"), l2=valid_l2("same"))
         counts['a'] += 1
-        
+
     # Same content, different project -> should pass
     for i in range(5):
-        write_bundle(f"valid_dup_diff_proj_{i}.json", {
-            "schema_version": "2.1",
-            "project_id": f"proj_dup_{i}",
-            "layer": 12,
-            "payload": {"view_hierarchy": {"type": "window", "id": "fixed_id_123"}, "index": "fixed"}
-        })
+        write_bundle(f"valid_dup_diff_proj_{i}.json", valid_l1(f"proj_dup_{i}", "same"), l2=valid_l2("same"))
         counts['a'] += 1
 
     # b. Malformed schema bundles
