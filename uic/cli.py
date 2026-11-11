@@ -79,7 +79,9 @@ def run_lane(root: Path, source: Path | None, l12: Path | None, l342: Path | Non
     import ingest
     import ingest_layer342
     from orchestrator.lock import simple_file_lock
-    from orchestrator.orchestrator import Pipeline, PipelineContext
+    from orchestrator.orchestrator import PipelineContext
+
+    from .pipeline import StrictPipeline
     root.mkdir(parents=True, exist_ok=True)
     with simple_file_lock(root / ".uic_run", timeout=600):
         run_id = None
@@ -151,12 +153,15 @@ def run_lane(root: Path, source: Path | None, l12: Path | None, l342: Path | Non
             if code != 0:
                 return EXIT_INGEST
             ctx = PipelineContext(run_id=run_id, manifest_path=root / "Manifest" / f"manifest_{run_id}.json")
-            rc = Pipeline().run(ctx)
+            rc = StrictPipeline().run(ctx)
             print(f"[pipeline] rc={rc} status={ctx.storage.get('pipeline_status')} errors={ctx.errors}")
             if rc != 0:
                 return EXIT_PIPELINE
             if export_dir:
-                man = export_dataset(root, export_dir, force=True)
+                if export_dir.exists() and any(export_dir.iterdir()):
+                    print(f"run: {export_dir} already exists; dataset versions are immutable (pick a new directory)")
+                    return EXIT_LINT
+                man = export_dataset(root, export_dir)
                 print(f"[export] {man['counts']}")
                 bad = verify_dataset(export_dir)
                 print(f"[verify] {'clean' if not bad else bad}")
@@ -222,11 +227,12 @@ def main(argv: list[str] | None = None) -> int:
         root = a.root.resolve()
         work = root / "_demo_inputs"
         work.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         s = fx.build_sample(project="demo")
-        (work / "source.png").write_bytes(b"demo-source:" + hashlib.sha256(str(root).encode()).digest())
+        (work / "source.png").write_bytes(b"demo-source:" + hashlib.sha256(stamp.encode()).digest())
         (work / "l12.txt").write_text(fx.text12(s), encoding="utf-8")
         (work / "l342.txt").write_text(fx.text342(s), encoding="utf-8")
-        rc = run_lane(root, work / "source.png", work / "l12.txt", work / "l342.txt", "demo", root / "Datasets" / "demo", True)
+        rc = run_lane(root, work / "source.png", work / "l12.txt", work / "l342.txt", "demo", root / "Datasets" / f"demo_{stamp}", True)
         print("DEMO", "PASSED" if rc == EXIT_OK else f"FAILED rc={rc}")
         return rc
     return EXIT_OK
