@@ -163,7 +163,7 @@ def build_row(root: Path, run_id: str) -> tuple[Row | None, list[str]]:
         clean[k], _ = scrub(layers[k], red)
     objs = l1_objects(clean["l1"])
     src_hash = man["image_hash"]
-    src_ref = next((str(p.relative_to(root)) for d in ("Images", "Sources") for p in sorted((Path(root) / d).glob(src_hash + ".*"))), None)
+    src_ref = next((p.relative_to(root).as_posix() for d in ("Images", "Sources") for p in sorted((Path(root) / d).glob(src_hash + ".*"))), None)
     project = str(layers["l1"].get("project_id") or "default_project")
     body = {"run_id_independent": {k: clean[k] for k in LAYER_FILES}, "source_hash": src_hash}
     row = Row(
