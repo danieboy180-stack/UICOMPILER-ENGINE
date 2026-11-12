@@ -1,0 +1,24 @@
+# Copy this file to .github/workflows/uic.yml to activate it.
+# (It lives here because the connection used to write this branch cannot create workflow files, same convention as tools/ci/ci.yml.)
+name: uic
+
+on:
+  push:
+    branches: [main, 'feat/**', 'fix/**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt pytest
+      - name: Full suite (engine + uic)
+        run: python -m pytest -q
+      - name: Repo CI gate
+        run: python ci_gate.py
+      - name: End-to-end smoke (lint, seal, ingest, pipeline, export, verify)
+        run: python -m uic demo --root "$RUNNER_TEMP/uic_demo"
