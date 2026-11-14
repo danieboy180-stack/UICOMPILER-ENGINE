@@ -14,3 +14,12 @@ __pycache__/
 test_*.txt
 scratch*.py
 BUILD_REPORT.md
+
+# uic runtime folders (inputs and model replies stay local; datasets and bundles/ are committed on purpose)
+Raw/
+Images/
+Sources/
+_inputs/
+_demo_inputs/
+.uic_run*
+Datasets/demo_*/
